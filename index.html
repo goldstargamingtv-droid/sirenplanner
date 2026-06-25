@@ -1,0 +1,2138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Siren Capture Planner — M5</title>
+
+<!--
+  Siren Capture Planner — single self-contained index.html
+  Milestone M1: scene skeleton (viewport, bed, subject, rig cameras + frustums,
+  interactive add/remove/drag, control panels, always-visible heatmap legend).
+  Coverage analysis (heatmap + scores) arrives in M2.
+
+  Architecture rules (CLAUDE.md / SPEC.md):
+    - One file, no build step, no backend. Three.js + addons + three-mesh-bvh via importmap (CDN).
+    - No localStorage/sessionStorage. State lives in JS; persistence via JSON import/export.
+    - Brand red->orange is UI chrome ONLY, never the heatmap.
+    - Bed is always an occluder; cameras hard-constrained to >= minCameraHeight; camera count unbounded.
+-->
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/",
+    "three-mesh-bvh": "https://unpkg.com/three-mesh-bvh@0.9.0/build/index.module.js"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #16161A;
+    --bg-2: #1d1d22;
+    --panel: rgba(28, 28, 34, 0.72);
+    --panel-border: rgba(249, 115, 22, 0.22);
+    --text: #e7e7ea;
+    --text-dim: #9b9ba3;
+    --text-faint: #6c6c75;
+    --accent-red: #ef4444;
+    --accent-orange: #f97316;
+    --accent-grad: linear-gradient(135deg, #ef4444 0%, #f97316 100%);
+    --field-bg: #121216;
+    --field-border: #34343c;
+
+    /* Heatmap class palette — DISTINCT from brand chrome, always legended (SPEC §5). */
+    --hm-good: #22c55e;
+    --hm-wide: #3b82f6;
+    --hm-low: #eab308;
+    --hm-single: #f59e0b;
+    --hm-fixable: #ff4d4d;
+    --hm-unfixable: #4b5563;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
+  body {
+    font-family: 'Cascadia Code', 'Cascadia Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    color: var(--text);
+    font-size: 12px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #viewport { position: fixed; inset: 0; z-index: 0; }
+  canvas { display: block; }
+
+  /* ---------- Glass panels ---------- */
+  .panel {
+    position: fixed;
+    z-index: 10;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    backdrop-filter: blur(13px) saturate(120%);
+    -webkit-backdrop-filter: blur(13px) saturate(120%);
+    box-shadow: 0 10px 32px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.04);
+  }
+  .panel-scroll { overflow-y: auto; }
+  .panel-scroll::-webkit-scrollbar { width: 9px; }
+  .panel-scroll::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+  .panel-scroll::-webkit-scrollbar-track { background: transparent; }
+
+  #topbar {
+    top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 14px;
+    padding: 8px 14px; max-width: calc(100vw - 24px); flex-wrap: wrap;
+  }
+  /* Side panels are anchored top+bottom (not max-height) so they scroll internally and
+     never overlap the legend (left) or HUD (right). #panel-left's bottom is refined in JS
+     from the legend's measured height. */
+  #panel-left  { top: 76px; left: 12px;  width: 286px; bottom: 196px; padding: 12px; }
+  #panel-right { top: 76px; right: 12px; width: 286px; bottom: 52px;  padding: 12px; }
+  #legend      { bottom: 12px; left: 12px; width: 286px; padding: 10px 12px; }
+
+  /* ---------- Branding ---------- */
+  .brand {
+    font-weight: 700; letter-spacing: 1.4px; font-size: 13px;
+    background: var(--accent-grad); -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; white-space: nowrap;
+  }
+  .badge {
+    font-size: 10px; padding: 2px 7px; border-radius: 999px;
+    background: var(--accent-grad); color: #fff; font-weight: 700; letter-spacing: .5px;
+  }
+  .sep { width: 1px; align-self: stretch; background: var(--field-border); margin: 2px 2px; }
+
+  /* ---------- Section headers ---------- */
+  .sec-title {
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--accent-orange); margin: 2px 0 9px; font-weight: 700;
+    border-left: 3px solid var(--accent-orange); padding-left: 7px;
+  }
+  .sec + .sec { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); }
+  .hint { color: var(--text-faint); font-size: 10px; line-height: 1.45; margin-top: 6px; }
+
+  /* ---------- Form rows ---------- */
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; }
+  .row label { color: var(--text-dim); flex: 0 0 auto; }
+  .row .ctl { flex: 1 1 auto; display: flex; gap: 5px; justify-content: flex-end; }
+  input[type="number"], input[type="text"], select {
+    background: var(--field-bg); color: var(--text);
+    border: 1px solid var(--field-border); border-radius: 6px;
+    padding: 4px 6px; font-family: inherit; font-size: 11px; width: 100%;
+  }
+  input[type="number"] { width: 60px; text-align: right; }
+  .vec input { width: 46px; }
+  select { width: auto; min-width: 96px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent-orange); }
+  input[type="checkbox"] { accent-color: var(--accent-orange); width: 14px; height: 14px; cursor: pointer; }
+
+  button {
+    font-family: inherit; font-size: 11px; cursor: pointer; color: var(--text);
+    background: #26262d; border: 1px solid var(--field-border); border-radius: 7px;
+    padding: 6px 10px; transition: border-color .12s, background .12s, transform .05s;
+  }
+  button:hover { border-color: var(--accent-orange); background: #2d2d35; }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.accent { background: var(--accent-grad); border: none; color: #fff; font-weight: 600; }
+  button.accent:hover { filter: brightness(1.08); }
+  button.ghost { background: transparent; }
+  .btn-row { display: flex; gap: 7px; margin-top: 8px; }
+  .btn-row button { flex: 1; }
+
+  /* ---------- Camera list ---------- */
+  #cam-list { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; }
+  .cam-item {
+    display: flex; align-items: center; gap: 7px;
+    background: #1b1b21; border: 1px solid var(--field-border);
+    border-radius: 7px; padding: 5px 7px;
+  }
+  .cam-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-orange); flex: 0 0 auto; box-shadow: 0 0 6px rgba(249,115,22,.6); }
+  .cam-name { flex: 1; font-size: 11px; }
+  .cam-item .tog { display: flex; align-items: center; gap: 3px; color: var(--text-faint); font-size: 9px; }
+  .cam-x {
+    background: transparent; border: none; color: var(--text-faint);
+    font-size: 14px; line-height: 1; padding: 2px 5px; border-radius: 5px;
+  }
+  .cam-x:hover { color: #fff; background: var(--accent-red); }
+  .cam-empty { color: var(--text-faint); font-size: 10px; padding: 4px 2px; }
+  .cam-marg { font-size: 9px; color: var(--text-faint); min-width: 42px; text-align: right; }
+
+  #soloBadge {
+    position: fixed; z-index: 12; bottom: 14px; left: 50%; transform: translateX(-50%);
+    display: none; background: rgba(251,191,36,0.16); border: 1px solid #fbbf24; color: #fde68a;
+    border-radius: 8px; padding: 5px 12px; font-size: 11px; font-weight: 600;
+    backdrop-filter: blur(8px); box-shadow: 0 6px 18px rgba(0,0,0,.4);
+  }
+
+  /* CSS2D in-viewport labels (camera IDs + spacing distances) */
+  .lbl { font-family: inherit; font-size: 10px; line-height: 1.3; color: var(--text);
+    background: rgba(22,22,26,0.72); border: 1px solid var(--field-border); border-radius: 5px;
+    padding: 1px 5px; white-space: nowrap; pointer-events: none; user-select: none; }
+  .lbl-cam { color: #fde68a; border-color: rgba(249,115,22,.45); }
+  .lbl-dist { color: #bae6fd; border-color: rgba(56,189,248,.45); }
+  .lbl-height { color: #ffffff; border-color: rgba(255,255,255,.35); }
+
+  /* ---------- Readouts (M2 placeholders) ---------- */
+  .readout-big { font-size: 30px; font-weight: 700; line-height: 1; margin: 2px 0; color: var(--text); }
+  .readout-big small { font-size: 12px; color: var(--text-faint); font-weight: 400; }
+  .pending { color: var(--text-faint); font-style: italic; }
+  .bars { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  .bar-row { display: grid; grid-template-columns: 92px 1fr 30px; align-items: center; gap: 7px; font-size: 10px; }
+  .bar-track { height: 7px; border-radius: 4px; background: #101014; overflow: hidden; }
+  .bar-fill { height: 100%; width: 0%; border-radius: 4px; }
+  .stat-line { display: flex; justify-content: space-between; color: var(--text-dim); margin: 5px 0; }
+  .stat-line b { color: var(--text); }
+
+  /* ---------- Legend ---------- */
+  .legend-title { display: flex; align-items: center; justify-content: space-between; }
+  .leg-grid { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+  .leg-item { display: flex; align-items: center; gap: 8px; font-size: 10.5px; }
+  .leg-sw { width: 13px; height: 13px; border-radius: 3px; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.12); }
+  .leg-item .leg-meta { color: var(--text-faint); margin-left: auto; font-size: 9px; }
+
+  /* ---------- HUD ---------- */
+  #hud {
+    position: fixed; z-index: 9; bottom: 12px; right: 12px;
+    font-size: 10px; color: var(--text-faint); text-align: right; line-height: 1.5;
+    pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+  }
+  #hud .ok { color: var(--hm-good); }
+  #hud .bad { color: var(--hm-fixable); }
+
+  #toast {
+    position: fixed; z-index: 30; bottom: 56px; left: 50%; transform: translateX(-50%);
+    background: #26262d; border: 1px solid var(--accent-orange); border-radius: 8px;
+    padding: 8px 14px; font-size: 11px; opacity: 0; transition: opacity .25s; pointer-events: none;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  #toast.show { opacity: 1; }
+
+  .group { display: flex; flex-direction: column; gap: 2px; }
+  .group > span { font-size: 9px; color: var(--text-faint); letter-spacing: .5px; }
+</style>
+</head>
+<body>
+  <div id="viewport"></div>
+
+  <!-- ============================ TOP BAR ============================ -->
+  <div id="topbar" class="panel">
+    <span class="brand">SIREN CAPTURE PLANNER</span>
+    <span class="badge">M5</span>
+    <div class="sep"></div>
+
+    <div class="group">
+      <span>SUBJECT</span>
+      <select id="subjectType" title="Procedural subject proxy">
+        <option value="human_reclining">Human · reclining</option>
+        <option value="human_seated">Human · seated</option>
+        <option value="human_standing">Human · standing</option>
+        <option value="sphere">Sphere</option>
+        <option value="capsule">Capsule</option>
+        <option value="cylinder">Cylinder</option>
+      </select>
+    </div>
+
+    <div class="group">
+      <span>LEN/HEIGHT m</span>
+      <input type="number" id="subjLen" step="0.05" min="0.3" />
+    </div>
+    <div class="group">
+      <span>THICKNESS m</span>
+      <input type="number" id="subjThick" step="0.02" min="0.05" />
+    </div>
+    <div class="sep"></div>
+
+    <div class="group">
+      <span>BED W·H·L m</span>
+      <div class="vec" style="display:flex;gap:3px;">
+        <input type="number" id="bedW" step="0.05" />
+        <input type="number" id="bedH" step="0.05" />
+        <input type="number" id="bedL" step="0.05" />
+      </div>
+    </div>
+    <div class="group">
+      <span>SAMPLES</span>
+      <input type="number" id="sampleCount" step="100" min="100" title="Surface samples — drives subject tessellation & coverage resolution" />
+    </div>
+    <div class="sep"></div>
+
+    <div class="btn-row" style="margin:0;">
+      <button id="btnExport" class="ghost">⤓ Export</button>
+      <button id="btnImport" class="ghost">⤒ Import</button>
+      <button id="btnOptimize" class="ghost" title="Run the camera-placement optimizer">⚙ Optimize</button>
+    </div>
+    <input type="file" id="fileImport" accept="application/json,.json" style="display:none" />
+  </div>
+
+  <!-- ============================ LEFT PANEL: RIG & CAMERA ============================ -->
+  <div id="panel-left" class="panel panel-scroll">
+    <div class="sec">
+      <div class="sec-title">Rig topology</div>
+      <div class="row"><label>Topology</label><div class="ctl">
+        <select id="topology">
+          <option value="dome">Dome (upper hemi)</option>
+          <option value="ring">Ring</option>
+          <option value="arc">Arc</option>
+          <option value="sphere">Sphere</option>
+        </select></div></div>
+      <div class="row"><label>Radius (m)</label><div class="ctl"><input type="number" id="radius" step="0.1" min="0.5" /></div></div>
+      <div class="row"><label>Min cam height (m)</label><div class="ctl"><input type="number" id="minHeight" step="0.05" min="0" /></div></div>
+      <div class="row"><label>Arc span (°)</label><div class="ctl"><input type="number" id="arcSpan" step="5" min="10" max="360" /></div></div>
+      <div class="row"><label>Look-at</label><div class="ctl vec">
+        <input type="number" id="lookX" step="0.05" /><input type="number" id="lookY" step="0.05" /><input type="number" id="lookZ" step="0.05" /></div></div>
+      <div class="btn-row">
+        <button id="btnDistribute" class="accent">Auto-distribute</button>
+        <button id="btnReset" class="ghost">Reset</button>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Camera intrinsics</div>
+      <div class="row"><label>FoV horiz (°)</label><div class="ctl"><input type="number" id="fovH" step="1" min="5" max="170" /></div></div>
+      <div class="row"><label>Aspect</label><div class="ctl"><input type="number" id="aspect" step="0.01" min="0.1" /></div></div>
+      <div class="row"><label>Near (m)</label><div class="ctl"><input type="number" id="near" step="0.05" min="0.01" /></div></div>
+      <div class="row"><label>Far (m)</label><div class="ctl"><input type="number" id="far" step="0.5" min="0.5" /></div></div>
+      <div class="hint">fovV derived as 2·atan(tan(fovH/2)/aspect). Frustum drawn short for clarity; coverage uses the true near/far.</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Cameras
+        <span style="float:right;color:var(--text-faint);font-weight:400;letter-spacing:0">unbounded</span></div>
+      <div class="row" style="margin-bottom:2px;">
+        <label>Count</label>
+        <div class="ctl">
+          <button id="btnRemoveCam" title="Remove last camera" style="padding:4px 9px;">−</button>
+          <span id="camCount" style="min-width:22px;text-align:center;align-self:center;font-weight:700;">0</span>
+          <button id="btnAddCam" class="accent" title="Add a camera on the dome">+ Add</button>
+        </div>
+      </div>
+      <div id="cam-list"></div>
+      <div class="hint">Drag a camera in the viewport to move it. Height is hard-clamped to ≥ min cam height. Lock to pin it.</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Room &amp; measurements</div>
+      <div class="row"><label>Show room</label><div class="ctl"><input type="checkbox" id="roomEnabled"></div></div>
+      <div class="row"><label>Room W·H·D (<span id="roomUnitLbl">ft</span>)</label><div class="ctl vec">
+        <input type="number" id="roomW" step="0.1" min="0.1"><input type="number" id="roomH" step="0.1" min="0.1"><input type="number" id="roomD" step="0.1" min="0.1"></div></div>
+      <div class="btn-row"><button id="fitDome" class="ghost" style="flex:1">Fit dome to room</button></div>
+      <div class="row"><label>Units (readouts)</label><div class="ctl">
+        <select id="units"><option value="m">meters</option><option value="ft">feet</option></select></div></div>
+      <div class="row"><label>Camera ID labels</label><div class="ctl"><input type="checkbox" id="showCamLabels"></div></div>
+      <div class="row"><label>Spacing labels</label><div class="ctl"><input type="checkbox" id="showSpacing"></div></div>
+      <div class="row"><label>Spacing pairs</label><div class="ctl">
+        <select id="spacingMode"><option value="nearest">Nearest neighbor</option><option value="all">All pairs</option></select></div></div>
+      <div class="row"><label>Tripods + heights</label><div class="ctl"><input type="checkbox" id="showTripods"></div></div>
+      <div class="stat-line"><span>Dome radius</span><b id="mRadius">—</b></div>
+      <div class="stat-line"><span>Spacing min/mean/max</span><b id="mSpacing">—</b></div>
+      <div class="stat-line"><span>Cam height min/mean/max</span><b id="mHeight">—</b></div>
+      <div class="stat-line"><span>Cams outside room</span><b id="mOutside">—</b></div>
+      <div class="hint">Room is a visual fit-check (cameras stay on the dome). Spacing labels show camera-to-camera distances — nearest neighbor, or every pair. Inputs are meters; readouts honor the unit selector.</div>
+    </div>
+  </div>
+
+  <!-- ============================ RIGHT PANEL: ANALYSIS (M2 scaffold) ============================ -->
+  <div id="panel-right" class="panel panel-scroll">
+    <div class="sec">
+      <div class="sec-title">Coverage score</div>
+      <div class="readout-big"><span id="goodPct" class="pending">—</span><small>GOOD% (usable parallax)</small></div>
+      <div class="bars" id="breakdown">
+        <div class="bar-row"><span>GOOD</span><div class="bar-track"><div id="goodBar" class="bar-fill" style="background:var(--hm-good)"></div></div><span id="goodVal">—</span></div>
+        <div class="bar-row"><span>WIDE_ONLY</span><div class="bar-track"><div id="wideBar" class="bar-fill" style="background:var(--hm-wide)"></div></div><span id="wideVal">—</span></div>
+        <div class="bar-row"><span>LOW_PARALLAX</span><div class="bar-track"><div id="lowBar" class="bar-fill" style="background:var(--hm-low)"></div></div><span id="lowVal">—</span></div>
+        <div class="bar-row"><span>SINGLE</span><div class="bar-track"><div id="singleBar" class="bar-fill" style="background:var(--hm-single)"></div></div><span id="singleVal">—</span></div>
+        <div class="bar-row"><span>HOLE·fix</span><div class="bar-track"><div id="holeFixBar" class="bar-fill" style="background:var(--hm-fixable)"></div></div><span id="holeFixVal">—</span></div>
+        <div class="bar-row"><span>HOLE·unfix</span><div class="bar-track"><div id="holeUnfixBar" class="bar-fill" style="background:var(--hm-unfixable)"></div></div><span id="holeUnfixVal">—</span></div>
+      </div>
+      <div class="hint" id="covNote">Live coverage. GOOD = ≥2 cameras with usable parallax; HOLE·unfix = occluded from the whole dome (needs infill).</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Region of interest</div>
+      <div class="row"><label>Enable ROI</label><div class="ctl"><input type="checkbox" id="roiEnabled"></div></div>
+      <div class="row"><label>Preset</label><div class="ctl">
+        <select id="roiPreset">
+          <option value="custom">Custom</option>
+          <option value="face">Face / head</option>
+          <option value="top">Top (up-facing)</option>
+          <option value="full">Full body</option>
+        </select></div></div>
+      <div class="row"><label>Shape</label><div class="ctl">
+        <select id="roiShape"><option value="box">Box</option><option value="sphere">Sphere</option></select></div></div>
+      <div class="row"><label>Center</label><div class="ctl vec">
+        <input type="number" id="roiCx" step="0.05"><input type="number" id="roiCy" step="0.05"><input type="number" id="roiCz" step="0.05"></div></div>
+      <div class="row"><label>Size / radius</label><div class="ctl vec">
+        <input type="number" id="roiSx" step="0.05"><input type="number" id="roiSy" step="0.05"><input type="number" id="roiSz" step="0.05"></div></div>
+      <div class="readout-big" style="font-size:22px;margin-top:6px;"><span id="roiGoodVal" class="pending">— (off)</span><small>ROI GOOD%</small></div>
+      <div class="hint">Drag the blue region in the viewport, or pick a preset. Score is GOOD% over surface inside the region only. For a sphere, the first size field is the radius.</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Optimizer &amp; export</div>
+      <div class="row"><label>Iterations</label><div class="ctl"><input type="number" id="optIters" step="100" min="50"></div></div>
+      <div class="row"><label>Min separation (°)</label><div class="ctl"><input type="number" id="optSep" step="1" min="0"></div></div>
+      <div class="btn-row">
+        <button id="optRun" class="accent">Run optimizer</button>
+        <button id="optCancel" class="ghost" style="display:none">Stop</button>
+        <button id="optRevert" class="ghost" style="display:none">Revert</button>
+      </div>
+      <div class="bar-track" style="height:8px;margin-top:9px;"><div id="optBar" class="bar-fill" style="width:0%;background:var(--accent-grad)"></div></div>
+      <div class="stat-line" style="margin-top:6px;"><span id="optStatus">idle</span><b id="optResult">—</b></div>
+      <div class="btn-row"><button id="optExport" class="ghost" style="flex:1">⤓ Export camera extrinsics (JSON)</button></div>
+      <div class="btn-row"><button id="exportPdf" class="ghost" style="flex:1">⤓ Export PDF report (image + all measurements)</button></div>
+      <div class="hint">Simulated annealing nudges <b>unlocked</b> cameras over the dome to maximize GOOD% (ROI-weighted when ROI is on) minus graph fragmentation, respecting min separation &amp; min height. Locked cameras stay fixed. Searches on a reduced sample set; the result is re-scored at full resolution.</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Connectivity</div>
+      <div class="row"><label>Show graph overlay</label><div class="ctl"><input type="checkbox" id="showConn"></div></div>
+      <div class="stat-line"><span>Components</span><b id="componentsVal">—</b></div>
+      <div class="stat-line"><span>Edges</span><b id="edgesVal">—</b></div>
+      <div class="stat-line"><span>Weakest bridge</span><b id="bridgeVal">—</b></div>
+      <div class="hint">Cyan link = co-visible at usable parallax (brighter = stronger). Amber = a bridge whose loss fragments the rig.</div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Matcher & thresholds</div>
+      <div class="row"><label>Preset</label><div class="ctl">
+        <select id="matcherPreset">
+          <option value="roma">RoMa</option>
+          <option value="colmap">COLMAP</option>
+          <option value="custom">Custom</option>
+        </select></div></div>
+      <div class="row"><label>Min parallax (°)</label><div class="ctl"><input type="number" id="minPar" step="1" /></div></div>
+      <div class="row"><label>Max parallax (°)</label><div class="ctl"><input type="number" id="maxPar" step="1" /></div></div>
+      <div class="row"><label>Grazing limit (°)</label><div class="ctl"><input type="number" id="grazing" step="1" /></div></div>
+      <div class="row"><label>Min edge points</label><div class="ctl"><input type="number" id="minEdge" step="5" /></div></div>
+      <div class="hint">Thresholds are heuristics — tune against your own reconstructions.</div>
+    </div>
+  </div>
+
+  <!-- ============================ HEATMAP LEGEND (always visible) ============================ -->
+  <div id="legend" class="panel">
+    <div class="legend-title">
+      <div class="sec-title" style="margin:0;border:none;padding:0;">Heatmap legend</div>
+      <span style="font-size:9px;color:var(--text-faint)">surface classes</span>
+    </div>
+    <div class="leg-grid">
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-good)"></span>GOOD <span class="leg-meta">≥2 cam · good parallax</span></div>
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-wide)"></span>WIDE_ONLY <span class="leg-meta">baselines too wide</span></div>
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-low)"></span>LOW_PARALLAX <span class="leg-meta">≥2 cam · too narrow</span></div>
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-single)"></span>SINGLE <span class="leg-meta">1 cam · billboards</span></div>
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-fixable)"></span>HOLE · fixable <span class="leg-meta">add a camera</span></div>
+      <div class="leg-item"><span class="leg-sw" style="background:var(--hm-unfixable)"></span>HOLE · unfixable <span class="leg-meta">needs infill</span></div>
+    </div>
+    <div class="hint">Heatmap paints live onto the subject; soloing a camera shows only its visible region.</div>
+  </div>
+
+  <div id="hud">
+    <div>cameras: <span id="hudCount">0</span></div>
+    <div>min-height ok: <span id="hudHeight" class="ok">✓</span></div>
+  </div>
+  <div id="soloBadge"></div>
+  <div id="toast"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { DragControls } from 'three/addons/controls/DragControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+
+// Wire three-mesh-bvh acceleration onto the prototypes now (M2 raycasting will use it).
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+
+// ============================================================================
+//  Config / data model (Blackmagic Micro Studio 4K G2 defaults — SPEC §3)
+// ============================================================================
+const DEFAULT_CONFIG = {
+  subject: { type: 'human_reclining', lengthOrHeight: 1.7, bodyThickness: 0.28, center: [0, 0.72, 0], sampleCount: 2000 },
+  bed:     { enabled: true, size: [1.5, 0.6, 2.0], topY: 0.6, center: [0, 0, 0] },
+  rig:     { topology: 'dome', cameraCount: 8, radius: 2.5, minCameraHeight: 0.6, arcSpanDeg: 360, lookAt: [0, 0.72, 0], cameras: [] },
+  camera:  { fovHDeg: 60, aspect: 16 / 9, near: 0.1, far: 10.0 },
+  matcher: { preset: 'colmap', minParallaxDeg: 10, maxParallaxDeg: 28, grazingLimitDeg: 78, minEdgePoints: 40 },
+  roi:     { enabled: false, shape: 'box', center: [0, 0.85, 0.4], size: [0.4, 0.4, 0.4] },
+  optimizer: { enabled: false, iterations: 1500, minCamSeparationDeg: 12, fixedCameras: [], objective: 'goodCoverage' },
+  // Physical-room reference + measurement display. Room is a visual fit-check, NOT a hard wall.
+  room:    { enabled: true, size: [5.5, 3.0, 5.5], center: [0, 0, 0] }, // [W(x), H(y), D(z)] m; floor at y=0 (fits the default dome)
+  display: { units: 'ft', camLabels: false, spacing: false, spacingMode: 'all', tripods: true },
+};
+const MATCHER_PRESETS = {
+  roma:   { minParallaxDeg: 8,  maxParallaxDeg: 45 },
+  colmap: { minParallaxDeg: 10, maxParallaxDeg: 28 },
+};
+
+let config = structuredClone(DEFAULT_CONFIG);
+
+// Heatmap palette mirror (kept in sync with CSS vars; reused by M2 vertex coloring).
+const CLASS_COLORS = {
+  GOOD: 0x22c55e, WIDE_ONLY: 0x3b82f6, LOW_PARALLAX: 0xeab308,
+  SINGLE: 0xf59e0b, HOLE_FIXABLE: 0xff4d4d, HOLE_UNFIXABLE: 0x4b5563,
+};
+
+// --- M2 coverage state & constants ---
+const EPS = 1e-3;          // raycast self-hit offset (m)
+const ESCAPE_FAR = 4.0;    // interior-culling probe distance (m)
+// Vertex-color attribute values are interpreted as LINEAR by the renderer, so convert from sRGB hex.
+const lin = hex => new THREE.Color(hex).convertSRGBToLinear();
+const COL = {
+  GOOD: lin(0x22c55e), WIDE: lin(0x3b82f6), LOW: lin(0xeab308), SINGLE: lin(0xf59e0b),
+  HOLE_FIX: lin(0xff4d4d), HOLE_UNFIX: lin(0x4b5563), BASE: lin(0xc7c9cf),
+};
+let EVAL = null;           // { count, pos[], nrm[], area, active, activeCount, reachable, color }
+const N_CANDIDATES = 64;   // dome samples for the fixable/unfixable (reachability) test
+let showConn = false;      // connectivity overlay toggle
+let connLines = null;      // THREE.LineSegments for the connectivity graph overlay
+// Reusable scratch objects (avoid per-vertex allocation in the hot loop).
+const _m4 = new THREE.Matrix4();
+const _dir = new THREE.Vector3();
+const _ray = new THREE.Raycaster();
+const _probe = new THREE.Raycaster();
+const _t1 = new THREE.Vector3(), _t2 = new THREE.Vector3(), _pd = new THREE.Vector3();
+const _seen = [];          // per-vertex unit rays to the cameras that see it (Vector3[])
+const _seenIdx = [];       // matching camera indices, parallel to _seen
+// Subject tessellation density driven by sampleCount (vertexCount ~ detail^2 ~ sampleCount).
+let SUBJ_DETAIL = 1;
+const segOf = base => Math.max(3, Math.round(base * SUBJ_DETAIL));
+
+const d2r = d => d * Math.PI / 180;
+const r2d = r => r * 180 / Math.PI;
+const fovVdeg = () => r2d(2 * Math.atan(Math.tan(d2r(config.camera.fovHDeg) / 2) / config.camera.aspect));
+const CAM_VIZ_LEN = 0.7; // frustum gizmo length (cosmetic — coverage uses the true near/far)
+
+// ============================================================================
+//  Renderer / scene / viewport camera
+// ============================================================================
+const container = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true }); // preserve → toDataURL for PDF
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x16161A, 1);
+container.appendChild(renderer.domElement);
+
+// CSS2D overlay for in-viewport text labels (camera IDs + spacing distances). pointer-events:none
+// so it never intercepts orbit/drag; z below the glass panels.
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+labelRenderer.domElement.style.position = 'fixed';
+labelRenderer.domElement.style.top = '0';
+labelRenderer.domElement.style.left = '0';
+labelRenderer.domElement.style.pointerEvents = 'none';
+labelRenderer.domElement.style.zIndex = '5';
+container.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x16161A, 9, 22);
+
+const viewCam = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 100);
+viewCam.position.set(3.6, 2.7, 3.9);
+
+const controls = new OrbitControls(viewCam, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 1.2;
+controls.maxDistance = 20;
+controls.target.set(...config.rig.lookAt);
+
+// Lighting — neutral so the (future) heatmap colors read true.
+scene.add(new THREE.HemisphereLight(0xbfc4cc, 0x141418, 0.95));
+const key = new THREE.DirectionalLight(0xffffff, 1.15); key.position.set(4, 7, 5); scene.add(key);
+const fill = new THREE.DirectionalLight(0x8899aa, 0.45); fill.position.set(-5, 3, -4); scene.add(fill);
+scene.add(new THREE.AmbientLight(0x404048, 0.6));
+
+// Floor grid for spatial reference.
+const grid = new THREE.GridHelper(10, 20, 0x2a2a32, 0x202028);
+grid.position.y = 0.001;
+scene.add(grid);
+
+// ============================================================================
+//  Geometry: bed (occluder) + subject (proxy)
+// ============================================================================
+let bedMesh = null;
+let subjectMesh = null;
+
+const bedMat = new THREE.MeshStandardMaterial({ color: 0x2b2b33, roughness: 0.92, metalness: 0.0 });
+const subjectMat = new THREE.MeshStandardMaterial({
+  color: 0xc7c9cf, roughness: 0.65, metalness: 0.02,
+  vertexColors: false, // M2 flips this on for the heatmap
+});
+
+function buildBed() {
+  if (bedMesh) { scene.remove(bedMesh); bedMesh.geometry.dispose(); }
+  const [w, h, l] = config.bed.size;
+  const geo = new THREE.BoxGeometry(w, h, l);
+  geo.translate(config.bed.center[0], h / 2, config.bed.center[2]); // floor-standing box, base at y=0
+  safeBVH(geo);
+  bedMesh = new THREE.Mesh(geo, bedMat);
+  bedMesh.visible = config.bed.enabled;
+  bedMesh.name = 'bed';
+  scene.add(bedMesh);
+  scheduleCoverage(0);        // the bed is an occluder — changing it changes visibility
+  scheduleReachability();     // ...and changes which holes are reachable
+}
+
+// --- Procedural subject builders -------------------------------------------
+function pushPart(parts, geo, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0) {
+  if (rx) geo.rotateX(rx);
+  if (ry) geo.rotateY(ry);
+  if (rz) geo.rotateZ(rz);
+  geo.translate(x, y, z);
+  parts.push(geo);
+}
+
+// Standing humanoid template: feet at y=0, +Y up, facing -Z, total height H.
+function humanoidStandingParts(H, thickness) {
+  const r = Math.max(0.05, thickness / 2);
+  const parts = [];
+  const headR = 0.067 * H;
+  pushPart(parts, new THREE.SphereGeometry(headR, segOf(22), segOf(16)), 0, H - headR, 0);
+  pushPart(parts, new THREE.CapsuleGeometry(0.42 * r, 0.07 * H, segOf(6), segOf(12)), 0, H - 2 * headR - 0.03 * H, 0); // neck
+  pushPart(parts, new THREE.CapsuleGeometry(r, 0.32 * H, segOf(8), segOf(18)), 0, 0.66 * H, 0);                         // torso
+  pushPart(parts, new THREE.SphereGeometry(1.02 * r, segOf(18), segOf(14)), 0, 0.48 * H, 0);                            // pelvis
+  pushPart(parts, new THREE.CapsuleGeometry(0.52 * r, 0.40 * H, segOf(6), segOf(12)),  0.45 * r, 0.22 * H, 0);          // leg R
+  pushPart(parts, new THREE.CapsuleGeometry(0.52 * r, 0.40 * H, segOf(6), segOf(12)), -0.45 * r, 0.22 * H, 0);          // leg L
+  pushPart(parts, new THREE.CapsuleGeometry(0.36 * r, 0.38 * H, segOf(6), segOf(12)),  (r + 0.42 * r), 0.62 * H, 0);    // arm R
+  pushPart(parts, new THREE.CapsuleGeometry(0.36 * r, 0.38 * H, segOf(6), segOf(12)), -(r + 0.42 * r), 0.62 * H, 0);    // arm L
+  return mergeGeometries(parts, false);
+}
+
+// Seated humanoid: buttocks ~origin, torso up (slight recline), thighs forward +Z, shins down.
+function humanoidSeatedParts(H, thickness) {
+  const r = Math.max(0.05, thickness / 2);
+  const parts = [];
+  const torsoLen = 0.30 * H, headR = 0.067 * H;
+  pushPart(parts, new THREE.SphereGeometry(1.05 * r, segOf(18), segOf(14)), 0, 0.02 * H, -0.02 * H);                         // pelvis
+  pushPart(parts, new THREE.CapsuleGeometry(r, torsoLen, segOf(8), segOf(18)), 0, 0.05 * H + torsoLen / 2, -0.05 * H, d2r(-8)); // torso, slight recline
+  pushPart(parts, new THREE.SphereGeometry(headR, segOf(22), segOf(16)), 0, 0.05 * H + torsoLen + 0.10 * H, -0.10 * H);      // head
+  pushPart(parts, new THREE.CapsuleGeometry(0.36 * r, 0.34 * H, segOf(6), segOf(12)),  (r + 0.42 * r), 0.10 * H, 0);          // arm R
+  pushPart(parts, new THREE.CapsuleGeometry(0.36 * r, 0.34 * H, segOf(6), segOf(12)), -(r + 0.42 * r), 0.10 * H, 0);          // arm L
+  pushPart(parts, new THREE.CapsuleGeometry(0.52 * r, 0.34 * H, segOf(6), segOf(12)),  0.5 * r, 0.0, 0.20 * H, d2r(90));      // thigh R (along +Z)
+  pushPart(parts, new THREE.CapsuleGeometry(0.52 * r, 0.34 * H, segOf(6), segOf(12)), -0.5 * r, 0.0, 0.20 * H, d2r(90));      // thigh L
+  pushPart(parts, new THREE.CapsuleGeometry(0.50 * r, 0.34 * H, segOf(6), segOf(12)),  0.5 * r, -0.20 * H, 0.40 * H);         // shin R (down)
+  pushPart(parts, new THREE.CapsuleGeometry(0.50 * r, 0.34 * H, segOf(6), segOf(12)), -0.5 * r, -0.20 * H, 0.40 * H);         // shin L
+  return mergeGeometries(parts, false);
+}
+
+function buildSubjectGeometry() {
+  const H = config.subject.lengthOrHeight;
+  const t = config.subject.bodyThickness;
+  SUBJ_DETAIL = Math.min(2.5, Math.max(0.5, Math.sqrt(config.subject.sampleCount / 2000)));
+  let geo;
+  switch (config.subject.type) {
+    case 'sphere':   geo = new THREE.SphereGeometry(Math.max(t, H * 0.25), segOf(40), segOf(28)); break;
+    case 'capsule':  geo = new THREE.CapsuleGeometry(t / 2, Math.max(0.05, H - t), segOf(12), segOf(28)); geo.rotateZ(d2r(90)); break; // lying along X
+    case 'cylinder': geo = new THREE.CylinderGeometry(t / 2, t / 2, H, segOf(32)); geo.rotateX(d2r(90)); break;               // lying along Z
+    case 'human_standing': geo = humanoidStandingParts(H, t); break;
+    case 'human_seated':   geo = humanoidSeatedParts(H, t); break;
+    case 'human_reclining':
+    default:               geo = humanoidStandingParts(H, t); geo.rotateX(d2r(-90)); break; // lie on back along Z, face up
+  }
+  // Rest the subject on the bed top: center X/Z over the bed, drop so its lowest point sits on topY.
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
+  const cx = (bb.min.x + bb.max.x) / 2;
+  const cz = (bb.min.z + bb.max.z) / 2;
+  const restY = (config.bed.enabled ? config.bed.topY : 0);
+  geo.translate(-cx + config.bed.center[0], -bb.min.y + restY, -cz + config.bed.center[2]);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function buildSubject() {
+  if (subjectMesh) { scene.remove(subjectMesh); subjectMesh.geometry.dispose(); }
+  const geo = buildSubjectGeometry();
+  safeBVH(geo);
+  subjectMesh = new THREE.Mesh(geo, subjectMat);
+  subjectMesh.name = 'subject';
+  scene.add(subjectMesh);
+  prepareEvaluation();        // resample surface + interior-cull for the new geometry
+  scheduleCoverage(0);        // immediate parallax/heatmap pass
+  scheduleReachability(0);    // (re)compute fixable/unfixable for the new vertices
+}
+
+function safeBVH(geo) {
+  try { geo.computeBoundsTree(); } catch (e) { console.warn('BVH build skipped:', e); }
+}
+
+// ============================================================================
+//  M2 — Coverage core: visibility test + area-weighted classification + heatmap
+// ============================================================================
+
+// Is this vertex on the true OUTER surface, or buried inside an overlapping body part?
+// Escape test: cast rays across the +normal hemisphere; exterior if ANY reaches open space.
+// We probe WIDE — rings out to near-grazing (85°) — so genuinely exterior crevices whose only
+// open sightline is near-tangent (between-legs valley, armpit, neck underside) are NOT culled.
+// Erring toward "exterior" is the safe side: a kept vertex merely reads as a visible HOLE,
+// whereas a false cull would silently hide real missing coverage. A truly buried vertex stays
+// culled because the enclosing shell blocks EVERY direction, grazing rays included.
+const PROBE_POLAR_DEG = [40, 65, 85];   // ring angles off the normal (plus the normal itself)
+function isExterior(P, N) {
+  _t1.set(1, 0, 0); if (Math.abs(N.x) > 0.9) _t1.set(0, 1, 0);
+  _t1.crossVectors(_t1, N).normalize();
+  _t2.crossVectors(N, _t1).normalize();
+  if (escapes(P, N, N)) return true;                 // straight out along the normal
+  for (const polarDeg of PROBE_POLAR_DEG) {
+    const cp = Math.cos(d2r(polarDeg)), sp = Math.sin(d2r(polarDeg));
+    for (let k = 0; k < 8; k++) {
+      const a = k * Math.PI / 4;
+      _pd.copy(N).multiplyScalar(cp).addScaledVector(_t1, sp * Math.cos(a)).addScaledVector(_t2, sp * Math.sin(a));
+      if (escapes(P, N, _pd)) return true;
+    }
+  }
+  return false;
+}
+function escapes(P, N, dir) {
+  _probe.ray.origin.copy(P).addScaledVector(N, EPS);
+  _probe.ray.direction.copy(dir).normalize();
+  _probe.near = 0; _probe.far = ESCAPE_FAR; _probe.firstHitOnly = true;
+  return _probe.intersectObject(subjectMesh, false).length === 0;
+}
+
+// Build the evaluation set from subject vertices: world positions + world normals,
+// per-vertex surface-area weights (area-honest %), interior culling, and the color attribute.
+function prepareEvaluation() {
+  EVAL = null;
+  if (!subjectMesh) return;
+  const geo = subjectMesh.geometry;
+  subjectMesh.updateMatrixWorld(true);
+  const mw = subjectMesh.matrixWorld;
+  const nmat = new THREE.Matrix3().getNormalMatrix(mw);
+  const posAttr = geo.attributes.position, nrmAttr = geo.attributes.normal;
+  const count = posAttr.count;
+  const pos = new Array(count), nrm = new Array(count);
+  for (let i = 0; i < count; i++) {
+    pos[i] = new THREE.Vector3().fromBufferAttribute(posAttr, i).applyMatrix4(mw);
+    nrm[i] = new THREE.Vector3().fromBufferAttribute(nrmAttr, i).applyMatrix3(nmat).normalize();
+  }
+  // Interior culling (one-time): drop vertices buried inside overlapping primitives.
+  const active = new Uint8Array(count);
+  let activeCount = 0;
+  for (let i = 0; i < count; i++) { active[i] = isExterior(pos[i], nrm[i]) ? 1 : 0; if (active[i]) activeCount++; }
+  // Per-vertex area = each triangle's area shared among its ACTIVE corners only, so the
+  // active-surface total stays an honest surface-area fraction even at culled boundaries.
+  const area = new Float32Array(count);
+  const idx = geo.index;
+  const triN = idx ? idx.count / 3 : count / 3;
+  const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
+  for (let t = 0; t < triN; t++) {
+    const i0 = idx ? idx.getX(t * 3) : t * 3, i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1, i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+    const k = active[i0] + active[i1] + active[i2];
+    if (!k) continue;
+    va.copy(pos[i0]); e1.subVectors(vb.copy(pos[i1]), va); e2.subVectors(vc.copy(pos[i2]), va);
+    const share = 0.5 * e1.cross(e2).length() / k;
+    if (active[i0]) area[i0] += share;
+    if (active[i1]) area[i1] += share;
+    if (active[i2]) area[i2] += share;
+  }
+  // Heatmap color attribute (neutral until computeCoverage fills it).
+  let colAttr = geo.attributes.color;
+  if (!colAttr || colAttr.count !== count) { colAttr = new THREE.BufferAttribute(new Float32Array(count * 3), 3); geo.setAttribute('color', colAttr); }
+  for (let i = 0; i < count; i++) colAttr.setXYZ(i, COL.BASE.r, COL.BASE.g, COL.BASE.b);
+  colAttr.needsUpdate = true;
+  subjectMat.vertexColors = true; subjectMat.color.set(0xffffff); subjectMat.needsUpdate = true;
+  EVAL = { count, pos, nrm, area, active, activeCount, reachable: null, color: colAttr };
+}
+
+// Shared visibility test (SPEC §6): facing+grazing, frustum (FoV+near/far), occlusion vs subject+bed.
+// On success leaves _dir = unit direction P->camera (reused for parallax).
+function pointVisibleTo(P, N, camPos, frustum, cosGraze, occluders) {
+  _dir.subVectors(camPos, P);
+  const dist = _dir.length();
+  if (dist < 1e-5) return false;
+  _dir.divideScalar(dist);
+  if (N.dot(_dir) <= cosGraze) return false;            // facing + grazing
+  if (!frustum.containsPoint(P)) return false;          // FoV + near/far
+  _ray.ray.origin.copy(P).addScaledVector(N, EPS);      // occlusion (subject + bed)
+  _ray.ray.direction.copy(_dir);
+  _ray.near = 0; _ray.far = Math.max(1e-4, dist - 2 * EPS); _ray.firstHitOnly = true;
+  return _ray.intersectObjects(occluders, false).length === 0;
+}
+
+function occluderList() {
+  const o = [subjectMesh];
+  if (config.bed.enabled && bedMesh) o.push(bedMesh);   // the bed is ALWAYS an occluder
+  return o;
+}
+
+// The cameras the heatmap is painted from: the soloed subset if any are soloed, else all.
+// Returns [{ rc, idx }] where idx is the rigCams index (kept for connectivity/marginal/labels).
+function activeCameras() {
+  const soloed = rigCams.filter(rc => rc.solo);
+  const list = soloed.length ? soloed : rigCams;
+  return list.map(rc => ({ rc, idx: rigCams.indexOf(rc) }));
+}
+
+// Per-vertex visibility → parallax class, hole fix/unfix, connectivity, marginal coverage, ROI.
+function computeCoverage() {
+  if (!EVAL || !subjectMesh) return;
+  const t0 = performance.now();
+  const m = config.matcher;
+  const cosGraze = Math.cos(d2r(m.grazingLimitDeg));
+  const minPar = d2r(m.minParallaxDeg), maxPar = d2r(m.maxParallaxDeg);
+  const occluders = occluderList();
+  const act = activeCameras();           // soloed subset, or the whole rig
+  const N = act.length;
+  const cams = act.map(a => {
+    syncPersp(a.rc);
+    _m4.multiplyMatrices(a.rc.persp.projectionMatrix, a.rc.persp.matrixWorldInverse);
+    return { pos: a.rc.persp.position.clone(), fr: new THREE.Frustum().setFromProjectionMatrix(_m4) };
+  });
+  while (_seen.length < N) _seen.push(new THREE.Vector3());
+  const covCount = N ? new Float64Array(N * N) : null;     // co-visibility per camera pair (slot space, i<j)
+  const parSum = N ? new Float64Array(N * N) : null;
+  const inc = new Int32Array(Math.max(1, N));              // per-vertex in-band incidence (reused)
+  const marginalArea = new Float64Array(rigCams.length);   // GOOD area lost if each camera removed (by rig index)
+  const reach = EVAL.reachable;
+  const roiOn = config.roi.enabled;
+  let aGood = 0, aWide = 0, aLow = 0, aSingle = 0, aHoleFix = 0, aHoleUnfix = 0, aTot = 0;
+  let roiGood = 0, roiTot = 0;
+  for (let i = 0; i < EVAL.count; i++) {
+    if (!EVAL.active[i]) { EVAL.color.setXYZ(i, COL.BASE.r, COL.BASE.g, COL.BASE.b); continue; }
+    const P = EVAL.pos[i], Nrm = EVAL.nrm[i], w = EVAL.area[i];
+    const inRoi = roiOn && pointInROI(P);
+    let k = 0;
+    for (let c = 0; c < N; c++) {
+      if (pointVisibleTo(P, Nrm, cams[c].pos, cams[c].fr, cosGraze, occluders)) { _seen[k].copy(_dir); _seenIdx[k] = c; k++; }
+    }
+    let col, isGood = false;
+    if (k === 0) {
+      // HOLE: fixable if SOME allowed dome camera could see it, else unfixable (needs infill).
+      if (reach && !reach[i]) { aHoleUnfix += w; col = COL.HOLE_UNFIX; }
+      else { aHoleFix += w; col = COL.HOLE_FIX; }   // reachable, or reachability not yet computed
+    } else if (k === 1) {
+      aSingle += w; col = COL.SINGLE;
+    } else {
+      // Pairwise parallax over the cameras that see P; full pairwise also feeds connectivity + marginal.
+      let anyInBand = false, maxAng = 0, totalInBand = 0;
+      for (let a = 0; a < k; a++) inc[a] = 0;
+      for (let a = 0; a < k; a++) {
+        for (let b = a + 1; b < k; b++) {
+          let d = _seen[a].dot(_seen[b]); d = d > 1 ? 1 : (d < -1 ? -1 : d);
+          const ang = Math.acos(d);
+          if (ang > maxAng) maxAng = ang;
+          if (ang >= minPar && ang <= maxPar) { anyInBand = true; totalInBand++; inc[a]++; inc[b]++; }
+          const e = _seenIdx[a] * N + _seenIdx[b];   // _seenIdx ascending → i<j
+          covCount[e]++; parSum[e] += ang;
+        }
+      }
+      if (anyInBand) {
+        aGood += w; col = COL.GOOD; isGood = true;
+        // Marginal: removing seen-camera c drops this point from GOOD iff every in-band pair touches c.
+        for (let c = 0; c < k; c++) if (totalInBand - inc[c] === 0) marginalArea[act[_seenIdx[c]].idx] += w;
+      } else if (maxAng < minPar) { aLow += w; col = COL.LOW; }   // all pairs too narrow
+      else { aWide += w; col = COL.WIDE; }                        // otherwise baselines too wide
+    }
+    aTot += w;
+    if (inRoi) { roiTot += w; if (isGood) roiGood += w; }
+    EVAL.color.setXYZ(i, col.r, col.g, col.b);
+  }
+  EVAL.color.needsUpdate = true;
+
+  // Connectivity edges: enough co-visible surface AND mean parallax inside the matcher band.
+  const edges = [];
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    const cc = covCount[i * N + j];
+    if (cc >= m.minEdgePoints) {
+      const mean = parSum[i * N + j] / cc;
+      if (mean >= minPar && mean <= maxPar) edges.push({ i, j, w: cc, mean });
+    }
+  }
+  const comps = countComponents(N, edges);
+  const bridgeIds = findBridges(N, edges);
+  let weakest = null; const bridgeSet = new Set();
+  edges.forEach((e, ei) => { if (bridgeIds.has(ei)) { bridgeSet.add(e.i + '-' + e.j); if (!weakest || e.w < weakest.w) weakest = e; } });
+  const slotRig = act.map(a => a.idx);
+  updateConnectivity(edges, bridgeSet, act);
+  updateConnUI(N, comps, edges.length, weakest, slotRig);
+
+  const pct = x => aTot > 0 ? 100 * x / aTot : 0;
+  updateCameraMarginals(Array.from(marginalArea, a => pct(a)));
+  updateROIUI(roiOn, roiTot > 0 ? 100 * roiGood / roiTot : null, roiTot);
+  updateSoloBadge();
+  updateCoverageUI({
+    good: pct(aGood), wide: pct(aWide), low: pct(aLow), single: pct(aSingle),
+    holeFix: pct(aHoleFix), holeUnfix: pct(aHoleUnfix),
+    nPts: EVAL.activeCount, ms: performance.now() - t0, reachPending: !reach,
+  });
+  updateMeasurements();
+}
+
+// A point is inside the ROI region (box: per-axis half-extent; sphere: size[0] = radius).
+function pointInROI(P) {
+  const r = config.roi, c = r.center;
+  if (r.shape === 'sphere') {
+    const dx = P.x - c[0], dy = P.y - c[1], dz = P.z - c[2];
+    return dx * dx + dy * dy + dz * dz <= r.size[0] * r.size[0];
+  }
+  return Math.abs(P.x - c[0]) <= r.size[0] / 2 && Math.abs(P.y - c[1]) <= r.size[1] / 2 && Math.abs(P.z - c[2]) <= r.size[2] / 2;
+}
+
+// Fixable vs unfixable: can ANY camera on the allowed dome see each point? Independent of the
+// current rig, so it recomputes only when the manifold/subject/intrinsics change (SPEC §7: lazy).
+function computeReachability() {
+  if (!EVAL || !subjectMesh) return;
+  const t0 = performance.now();
+  const cosGraze = Math.cos(d2r(config.matcher.grazingLimitDeg));
+  const occluders = occluderList();
+  const lookAt = new THREE.Vector3(...config.rig.lookAt);
+  const cam = new THREE.PerspectiveCamera(fovVdeg(), config.camera.aspect, config.camera.near, config.camera.far);
+  const cands = [];
+  for (let i = 0; i < N_CANDIDATES; i++) {
+    const pos = domePoint(i, N_CANDIDATES);
+    cam.position.copy(pos); cam.up.set(0, 1, 0); cam.lookAt(lookAt); cam.updateMatrixWorld(true);
+    _m4.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    cands.push({ pos: pos.clone(), fr: new THREE.Frustum().setFromProjectionMatrix(_m4) });
+  }
+  const reachable = new Uint8Array(EVAL.count);
+  for (let i = 0; i < EVAL.count; i++) {
+    if (!EVAL.active[i]) continue;
+    const P = EVAL.pos[i], Nrm = EVAL.nrm[i];
+    for (let c = 0; c < N_CANDIDATES; c++) {
+      if (pointVisibleTo(P, Nrm, cands[c].pos, cands[c].fr, cosGraze, occluders)) { reachable[i] = 1; break; }
+    }
+  }
+  EVAL.reachable = reachable;
+  _reachMs = performance.now() - t0;
+}
+
+let _covTimer = null, _reachTimer = null, _reachMs = 0;
+function scheduleCoverage(delay = 150) {
+  if (!EVAL) return;
+  clearTimeout(_covTimer);
+  _covTimer = setTimeout(() => { try { computeCoverage(); } catch (e) { console.error('coverage error', e); } }, delay);
+}
+// Heavy candidate pass; debounced longer. Recomputes reachability, then recolors holes.
+function scheduleReachability(delay = 350) {
+  if (!EVAL) return;
+  clearTimeout(_reachTimer);
+  _reachTimer = setTimeout(() => { try { computeReachability(); computeCoverage(); } catch (e) { console.error('reachability error', e); } }, delay);
+}
+
+// --- Connectivity graph helpers --------------------------------------------
+function countComponents(N, edges) {
+  const parent = Array.from({ length: N }, (_, i) => i);
+  const find = x => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  for (const e of edges) { const ra = find(e.i), rb = find(e.j); if (ra !== rb) parent[ra] = rb; }
+  let c = 0; for (let i = 0; i < N; i++) if (find(i) === i) c++;
+  return c;
+}
+// Tarjan bridge finder (edge ids skip the parent edge so multi-edges are handled). Depth ≤ N.
+function findBridges(N, edges) {
+  const adj = Array.from({ length: N }, () => []);
+  edges.forEach((e, ei) => { adj[e.i].push([e.j, ei]); adj[e.j].push([e.i, ei]); });
+  const disc = new Array(N).fill(-1), low = new Array(N).fill(0), bridges = new Set();
+  let timer = 0;
+  const dfs = (u, peId) => {
+    disc[u] = low[u] = timer++;
+    for (const [v, ei] of adj[u]) {
+      if (ei === peId) continue;
+      if (disc[v] === -1) { dfs(v, ei); low[u] = Math.min(low[u], low[v]); if (low[v] > disc[u]) bridges.add(ei); }
+      else low[u] = Math.min(low[u], disc[v]);
+    }
+  };
+  for (let i = 0; i < N; i++) if (disc[i] === -1) dfs(i, -1);
+  return bridges;
+}
+
+function updateConnectivity(edges, bridgeSet, act) {
+  if (connLines) { scene.remove(connLines); connLines.geometry.dispose(); connLines.material.dispose(); connLines = null; }
+  if (!showConn || !edges.length) return;
+  const cEdge = lin(0x2dd4bf), cBridge = lin(0xf59e0b);
+  let wMax = 1; for (const e of edges) if (e.w > wMax) wMax = e.w;
+  const positions = [], colors = [];
+  for (const e of edges) {
+    const a = act[e.i].rc.body.position, b = act[e.j].rc.body.position;
+    const base = bridgeSet.has(e.i + '-' + e.j) ? cBridge : cEdge;
+    const t = 0.35 + 0.65 * (e.w / wMax);   // brighter = more co-visible (thickness proxy; WebGL lines are 1px)
+    positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    colors.push(base.r * t, base.g * t, base.b * t, base.r * t, base.g * t, base.b * t);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  connLines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.92 }));
+  connLines.raycast = () => {};
+  scene.add(connLines);
+}
+
+function updateConnUI(N, comps, edgeCount, weakest, slotRig) {
+  const cEl = $('componentsVal');
+  if (N === 0) { cEl.textContent = '—'; cEl.style.color = ''; }
+  else if (comps > 1) { cEl.textContent = `${comps} ⚠ fragmented`; cEl.style.color = 'var(--hm-fixable)'; }
+  else { cEl.textContent = '1 · connected'; cEl.style.color = 'var(--hm-good)'; }
+  $('edgesVal').textContent = N ? String(edgeCount) : '—';
+  const bEl = $('bridgeVal');
+  if (weakest) { bEl.textContent = `CAM ${slotRig[weakest.i] + 1}–${slotRig[weakest.j] + 1} (${weakest.w} pts)`; bEl.style.color = 'var(--hm-low)'; }
+  else if (N > 1 && edgeCount) { bEl.textContent = 'none — robust'; bEl.style.color = 'var(--hm-good)'; }
+  else { bEl.textContent = '—'; bEl.style.color = ''; }
+}
+
+function updateCoverageUI(s) {
+  const g = $('goodPct'); g.textContent = s.good.toFixed(1); g.classList.remove('pending');
+  const setBar = (bar, val, v) => { $(bar).style.width = Math.max(0, Math.min(100, v)) + '%'; const e = $(val); e.textContent = v.toFixed(1) + '%'; e.classList.remove('pending'); };
+  setBar('goodBar', 'goodVal', s.good);
+  setBar('wideBar', 'wideVal', s.wide);
+  setBar('lowBar', 'lowVal', s.low);
+  setBar('singleBar', 'singleVal', s.single);
+  setBar('holeFixBar', 'holeFixVal', s.holeFix);
+  setBar('holeUnfixBar', 'holeUnfixVal', s.holeUnfix);
+  const reachNote = s.reachPending ? ' · computing fixable/unfixable…' : ` · holes reach-tested ${_reachMs.toFixed(0)} ms`;
+  $('covNote').innerHTML = `Live · ${s.nPts} surface pts (area-weighted) · ${s.ms.toFixed(0)} ms${reachNote}.`;
+}
+
+// --- M4: solo badge, marginal coverage, ROI ---------------------------------
+let roiMesh = null;
+const roiMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.14, depthWrite: false });
+
+function updateSoloBadge() {
+  const soloed = rigCams.map((rc, i) => rc.solo ? i + 1 : null).filter(x => x !== null);
+  const b = $('soloBadge');
+  if (soloed.length) { b.textContent = `SOLO · CAM ${soloed.join(', ')} — heatmap shows only these`; b.style.display = 'block'; }
+  else b.style.display = 'none';
+}
+
+// Write per-camera marginal GOOD% (lost if removed) into the camera list rows, in rigCams order.
+function updateCameraMarginals(margPct) {
+  const soloOn = rigCams.some(rc => rc.solo);
+  document.querySelectorAll('#cam-list .cam-marg').forEach((cell, i) => {
+    if (i >= rigCams.length) return;
+    const active = !soloOn || rigCams[i].solo;
+    cell.textContent = active ? `Δ${(margPct[i] || 0).toFixed(1)}%` : '—';
+  });
+}
+
+function updateROIUI(on, pct, totArea) {
+  const el = $('roiGoodVal'); el.classList.remove('pending');
+  if (!on) { el.textContent = '— (off)'; el.style.color = ''; return; }
+  if (pct === null || totArea <= 0) { el.textContent = 'no surface in region'; el.style.color = 'var(--text-faint)'; return; }
+  el.textContent = pct.toFixed(1) + '%';
+  el.style.color = pct >= 60 ? 'var(--hm-good)' : (pct >= 30 ? 'var(--hm-low)' : 'var(--hm-fixable)');
+}
+
+// Draggable ROI region gizmo (box or sphere). Rebuilt on shape/size change; moved on center change.
+function buildROIGizmo() {
+  if (roiMesh) { scene.remove(roiMesh); roiMesh.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material && o.material !== roiMat) o.material.dispose(); }); roiMesh = null; }
+  if (config.roi.enabled) {
+    const r = config.roi;
+    const geo = r.shape === 'sphere'
+      ? new THREE.SphereGeometry(Math.max(0.02, r.size[0]), 24, 16)
+      : new THREE.BoxGeometry(Math.max(0.02, r.size[0]), Math.max(0.02, r.size[1]), Math.max(0.02, r.size[2]));
+    roiMesh = new THREE.Mesh(geo, roiMat);
+    roiMesh.position.set(...r.center);
+    roiMesh.userData.roi = true;
+    const wire = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0x7dd3fc, transparent: true, opacity: 0.85 }));
+    wire.raycast = () => {};   // wire is decoration, not a drag target
+    roiMesh.add(wire);
+    scene.add(roiMesh);
+  }
+  rebuildDrag();   // include/exclude the ROI handle in the draggable set
+}
+
+// Body-part presets computed from the subject bounding box (head end depends on pose).
+function applyROIPreset(name) {
+  if (name === 'custom' || !subjectMesh) return;
+  subjectMesh.geometry.computeBoundingBox();
+  const bb = subjectMesh.geometry.boundingBox;
+  const c = new THREE.Vector3(); bb.getCenter(c);
+  const s = new THREE.Vector3(); bb.getSize(s);
+  const r = config.roi;
+  if (name === 'full') { r.shape = 'box'; r.center = [c.x, c.y, c.z]; r.size = [s.x * 1.02, s.y * 1.02, s.z * 1.02]; }
+  else if (name === 'top') { r.shape = 'box'; r.center = [c.x, c.y + s.y * 0.25, c.z]; r.size = [s.x * 1.02, s.y * 0.5, s.z * 1.02]; }
+  else if (name === 'face') {
+    r.shape = 'sphere';
+    const reclining = config.subject.type === 'human_reclining';
+    // Reclining head sits at the −Z end near the top; seated/standing/primitive heads are at the top.
+    r.center = reclining ? [c.x, bb.max.y - s.y * 0.16, bb.min.z + s.z * 0.13] : [c.x, bb.max.y - s.y * 0.12, c.z];
+    r.size = [Math.max(s.x, s.z) * 0.28, 0, 0];
+  }
+}
+
+function syncROIFields() {
+  const r = config.roi;
+  $('roiEnabled').checked = r.enabled;
+  $('roiShape').value = r.shape;
+  $('roiCx').value = +r.center[0].toFixed(3); $('roiCy').value = +r.center[1].toFixed(3); $('roiCz').value = +r.center[2].toFixed(3);
+  $('roiSx').value = +r.size[0].toFixed(3); $('roiSy').value = +r.size[1].toFixed(3); $('roiSz').value = +r.size[2].toFixed(3);
+}
+
+// ============================================================================
+//  M5 — Optimizer (simulated annealing) + extrinsics export
+// ============================================================================
+const _optCam = new THREE.PerspectiveCamera();
+const _optTarget = new THREE.Vector3();
+const _optFrusta = [];
+const _vA = new THREE.Vector3(), _vB = new THREE.Vector3();
+let _optCov = null, _optPar = null;
+let _opt = null;            // running state { cancel, snapshot }
+let optSnapshot = null;     // positions before the last run (for Revert)
+let optBefore = 0;
+
+// Reduced area-weighted sample set for the search (full re-score happens at finish).
+function buildReducedSamples(target) {
+  const idxs = [];
+  for (let i = 0; i < EVAL.count; i++) if (EVAL.active[i]) idxs.push(i);
+  const stride = Math.max(1, Math.floor(idxs.length / target));
+  const roiOn = config.roi.enabled;
+  const out = [];
+  for (let j = 0; j < idxs.length; j += stride) {
+    const i = idxs[j];
+    out.push({ pos: EVAL.pos[i], nrm: EVAL.nrm[i], w: EVAL.area[i], roi: roiOn && pointInROI(EVAL.pos[i]) });
+  }
+  return out;
+}
+
+// Objective = GOOD-fraction (ROI-weighted if ROI is on) − fragmentation penalty. Higher is better.
+function optObjective(positions, sample) {
+  const m = config.matcher;
+  const cosGraze = Math.cos(d2r(m.grazingLimitDeg));
+  const minPar = d2r(m.minParallaxDeg), maxPar = d2r(m.maxParallaxDeg);
+  const occluders = occluderList();
+  const N = positions.length;
+  while (_optFrusta.length < N) _optFrusta.push(new THREE.Frustum());
+  while (_seen.length < N) _seen.push(new THREE.Vector3());
+  _optCam.fov = fovVdeg(); _optCam.aspect = config.camera.aspect; _optCam.near = config.camera.near; _optCam.far = config.camera.far; _optCam.updateProjectionMatrix();
+  _optTarget.set(...config.rig.lookAt);
+  for (let c = 0; c < N; c++) {
+    _optCam.position.copy(positions[c]); _optCam.up.set(0, 1, 0); _optCam.lookAt(_optTarget); _optCam.updateMatrixWorld(true);
+    _m4.multiplyMatrices(_optCam.projectionMatrix, _optCam.matrixWorldInverse);
+    _optFrusta[c].setFromProjectionMatrix(_m4);
+  }
+  if (!_optCov || _optCov.length < N * N) { _optCov = new Float64Array(N * N); _optPar = new Float64Array(N * N); }
+  const cov = _optCov, par = _optPar; if (N) { cov.fill(0, 0, N * N); par.fill(0, 0, N * N); }
+  let good = 0, tot = 0, roiGood = 0, roiTot = 0;
+  for (let si = 0; si < sample.length; si++) {
+    const s = sample[si];
+    let k = 0;
+    for (let c = 0; c < N; c++) if (pointVisibleTo(s.pos, s.nrm, positions[c], _optFrusta[c], cosGraze, occluders)) { _seen[k].copy(_dir); _seenIdx[k] = c; k++; }
+    let isGood = false;
+    if (k >= 2) {
+      let anyInBand = false;
+      for (let a = 0; a < k; a++) for (let b = a + 1; b < k; b++) {
+        let d = _seen[a].dot(_seen[b]); d = d > 1 ? 1 : (d < -1 ? -1 : d);
+        const ang = Math.acos(d);
+        if (ang >= minPar && ang <= maxPar) anyInBand = true;
+        const e = _seenIdx[a] * N + _seenIdx[b]; cov[e]++; par[e] += ang;
+      }
+      if (anyInBand) isGood = true;
+    }
+    tot += s.w; if (isGood) good += s.w;
+    if (s.roi) { roiTot += s.w; if (isGood) roiGood += s.w; }
+  }
+  // Fragmentation penalty (threshold scaled to the reduced sample count).
+  const effMinEdge = Math.max(2, m.minEdgePoints * sample.length / Math.max(1, EVAL.activeCount));
+  const edges = [];
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    const cc = cov[i * N + j];
+    if (cc >= effMinEdge) { const mean = par[i * N + j] / cc; if (mean >= minPar && mean <= maxPar) edges.push({ i, j }); }
+  }
+  const frag = 0.12 * Math.max(0, countComponents(N, edges) - 1);
+  const gAll = tot > 0 ? good / tot : 0;
+  const gRoi = roiTot > 0 ? roiGood / roiTot : 0;
+  const base = (config.roi.enabled && roiTot > 0) ? 0.4 * gAll + 0.6 * gRoi : gAll;
+  return base - frag;
+}
+
+// Perturb a dome position: jitter azimuth/elevation, keep on the radius sphere, honor minCameraHeight.
+function perturbOnDome(pos, scale) {
+  const c = config.rig, cx = config.bed.center[0], cz = config.bed.center[2], r = c.radius;
+  let az = Math.atan2(pos.z - cz, pos.x - cx);
+  let el = Math.asin(Math.max(-1, Math.min(1, pos.y / r)));
+  az += (Math.random() * 2 - 1) * scale * 1.3;
+  el += (Math.random() * 2 - 1) * scale * 0.9;
+  el = Math.max(0, Math.min(Math.PI / 2 * 0.999, el));   // upper hemisphere
+  const horiz = r * Math.cos(el);
+  const out = new THREE.Vector3(cx + horiz * Math.cos(az), r * Math.sin(el), cz + horiz * Math.sin(az));
+  return finalizeOnDome(out);   // enforce minCameraHeight + snap onto the rig sphere (same as every other path)
+}
+
+function angularSepRad(a, b) {
+  const cx = config.bed.center[0], cz = config.bed.center[2];
+  _vA.set(a.x - cx, a.y, a.z - cz).normalize();
+  _vB.set(b.x - cx, b.y, b.z - cz).normalize();
+  let d = _vA.dot(_vB); d = d > 1 ? 1 : (d < -1 ? -1 : d);
+  return Math.acos(d);
+}
+function separationOK(idx, cand, positions, minSepRad) {
+  for (let j = 0; j < positions.length; j++) { if (j === idx) continue; if (angularSepRad(cand, positions[j]) < minSepRad) return false; }
+  return true;
+}
+
+function setOptRunning(on) {
+  $('optRun').disabled = on; $('btnOptimize').disabled = on;
+  $('optCancel').style.display = on ? 'inline-block' : 'none';
+  $('optStatus').textContent = on ? 'optimizing…' : 'done';
+}
+
+// Simulated annealing, time-sliced across animation frames so the tab stays responsive.
+function runOptimizer() {
+  if (!EVAL || rigCams.length === 0 || _opt) return;
+  const sample = buildReducedSamples(450);
+  if (!sample.length) { toast('No surface to optimize'); return; }
+  const movIdx = []; for (let i = 0; i < rigCams.length; i++) if (!rigCams[i].locked) movIdx.push(i);
+  if (!movIdx.length) { toast('All cameras locked — unlock some to optimize'); return; }
+  clearTimeout(_covTimer);
+  config.optimizer.iterations = Math.max(50, Math.floor(num('optIters', 1500)));
+  config.optimizer.minCamSeparationDeg = Math.max(0, num('optSep', 12));
+  config.optimizer.fixedCameras = rigCams.map((rc, i) => rc.locked ? i : -1).filter(i => i >= 0);
+  optBefore = parseFloat($('goodPct').textContent) || 0;
+  const positions = rigCams.map(rc => rc.body.position.clone());
+  const snapshot = positions.map(p => p.clone());
+  const minSepRad = d2r(config.optimizer.minCamSeparationDeg);
+  const total = config.optimizer.iterations;
+  let T = 0.6; const Tmin = 0.02, cool = Math.pow(Tmin / T, 1 / total);
+  let curE = -optObjective(positions, sample);
+  let best = positions.map(p => p.clone()), bestE = curE;
+  let iter = 0;
+  _opt = { cancel: false, snapshot };
+  setOptRunning(true);
+  $('optRevert').style.display = 'none';
+
+  function chunk() {
+    const t0 = performance.now();
+    while (iter < total && !_opt.cancel && performance.now() - t0 < 16) {
+      const k = movIdx[(Math.random() * movIdx.length) | 0];
+      const cand = perturbOnDome(positions[k], 0.05 + 0.5 * T);
+      iter++; T *= cool;
+      if (!separationOK(k, cand, positions, minSepRad)) continue;
+      const old = positions[k]; positions[k] = cand;
+      const eNew = -optObjective(positions, sample);
+      if (eNew < curE || Math.random() < Math.exp(-(eNew - curE) / Math.max(1e-4, T))) {
+        curE = eNew;
+        if (eNew < bestE) { bestE = eNew; best = positions.map(p => p.clone()); }
+      } else { positions[k] = old; }   // reject
+    }
+    updateOptProgress(iter / total, -bestE);
+    if (iter < total && !_opt.cancel) requestAnimationFrame(chunk);
+    else finishOptimizer(best);
+  }
+  requestAnimationFrame(chunk);
+}
+
+function updateOptProgress(frac, bestObj) {
+  $('optBar').style.width = (frac * 100) + '%';
+  $('optStatus').textContent = `optimizing… ${Math.round(frac * 100)}% · best ${(bestObj * 100).toFixed(1)}`;
+}
+
+function finishOptimizer(best) {
+  const cancelled = _opt.cancel;
+  optSnapshot = _opt.snapshot;
+  for (let i = 0; i < rigCams.length; i++) {
+    rigCams[i].body.position.copy(best[i]);
+    if (rigCams[i].body.position.y < config.rig.minCameraHeight) rigCams[i].body.position.y = config.rig.minCameraHeight; // hard floor safety net
+    aimGizmo(rigCams[i]);
+  }
+  _opt = null;
+  setOptRunning(false);
+  updateHUD();
+  computeCoverage();   // full-resolution re-score (SPEC §7)
+  const after = parseFloat($('goodPct').textContent) || 0;
+  $('optBar').style.width = '100%';
+  $('optStatus').textContent = cancelled ? 'stopped' : 'done';
+  const delta = after - optBefore;
+  $('optResult').textContent = `${optBefore.toFixed(1)}% → ${after.toFixed(1)}% (${delta >= 0 ? '+' : ''}${delta.toFixed(1)})`;
+  $('optResult').style.color = delta >= 0 ? 'var(--hm-good)' : 'var(--hm-fixable)';
+  $('optRevert').style.display = 'inline-block';
+  toast(cancelled ? 'Optimizer stopped' : `Optimized: GOOD ${optBefore.toFixed(1)}% → ${after.toFixed(1)}%`);
+}
+
+function revertOptimizer() {
+  if (!optSnapshot) return;
+  for (let i = 0; i < rigCams.length && i < optSnapshot.length; i++) { rigCams[i].body.position.copy(optSnapshot[i]); aimGizmo(rigCams[i]); }
+  optSnapshot = null;
+  $('optRevert').style.display = 'none';
+  $('optResult').textContent = 'reverted'; $('optResult').style.color = '';
+  $('optBar').style.width = '0%'; $('optStatus').textContent = 'idle';
+  updateHUD(); computeCoverage();
+}
+
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Final camera extrinsics for matching the physical rig / feeding the pipeline.
+function exportExtrinsics() {
+  const cameras = rigCams.map((rc, i) => {
+    syncPersp(rc);
+    const q = rc.persp.quaternion;
+    return {
+      index: i,
+      position: rc.body.position.toArray().map(v => +v.toFixed(5)),
+      target: rc.target.toArray().map(v => +v.toFixed(5)),
+      quaternion: [q.x, q.y, q.z, q.w].map(v => +v.toFixed(6)),
+      fovHDeg: config.camera.fovHDeg,
+      fovVDeg: +fovVdeg().toFixed(4),
+      locked: rc.locked,
+    };
+  });
+  downloadJSON({
+    generatedBy: 'Siren Capture Planner',
+    intrinsics: { fovHDeg: config.camera.fovHDeg, fovVDeg: +fovVdeg().toFixed(4), aspect: config.camera.aspect, near: config.camera.near, far: config.camera.far },
+    rig: { topology: config.rig.topology, radius: config.rig.radius, minCameraHeight: config.rig.minCameraHeight, lookAt: config.rig.lookAt },
+    cameraCount: cameras.length, cameras,
+  }, 'siren-rig-extrinsics.json');
+  toast('Exported camera extrinsics');
+}
+
+// ============================================================================
+//  Room reference + camera-spacing measurements
+// ============================================================================
+let roomLines = null, spacingLines = null, spacingLabels = [];
+const camBodyMatOutside = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0x6a1010, emissiveIntensity: 0.8, roughness: 0.45, metalness: 0.3 });
+const M_PER_FT = 0.3048;
+function fmtLen(m) { return config.display.units === 'ft' ? (m / M_PER_FT).toFixed(2) + ' ft' : m.toFixed(2) + ' m'; }
+
+// Room dimension inputs are shown/edited in the selected unit; config.room.size stays in meters.
+function syncRoomFields() {
+  const ft = config.display.units === 'ft', ru = ft ? 1 / M_PER_FT : 1;
+  $('roomW').value = +(config.room.size[0] * ru).toFixed(2);
+  $('roomH').value = +(config.room.size[1] * ru).toFixed(2);
+  $('roomD').value = +(config.room.size[2] * ru).toFixed(2);
+  $('roomUnitLbl').textContent = ft ? 'ft' : 'm';
+}
+
+function buildRoom() {
+  if (roomLines) { scene.remove(roomLines); roomLines.geometry.dispose(); roomLines.material.dispose(); roomLines = null; }
+  if (config.room.enabled) {
+    const [W, H, D] = config.room.size, c = config.room.center;
+    const box = new THREE.BoxGeometry(Math.max(0.1, W), Math.max(0.1, H), Math.max(0.1, D));
+    const edges = new THREE.EdgesGeometry(box); box.dispose();
+    edges.translate(c[0], H / 2, c[2]);   // floor of the room at y=0
+    roomLines = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x4a4a57, transparent: true, opacity: 0.9 }));
+    roomLines.raycast = () => {};
+    scene.add(roomLines);
+  }
+  updateMeasurements();
+}
+
+function cameraOutsideRoom(pos) {
+  if (!config.room.enabled) return false;
+  const [W, H, D] = config.room.size, c = config.room.center, e = 1e-4;
+  return Math.abs(pos.x - c[0]) > W / 2 + e || Math.abs(pos.z - c[2]) > D / 2 + e || pos.y > H + e || pos.y < -e;
+}
+
+function clearSpacing() {
+  if (spacingLines) { scene.remove(spacingLines); spacingLines.geometry.dispose(); spacingLines.material.dispose(); spacingLines = null; }
+  for (const l of spacingLabels) { scene.remove(l); if (l.element && l.element.parentNode) l.element.parentNode.removeChild(l.element); }
+  spacingLabels = [];
+}
+
+function buildSpacing(pairs) {
+  clearSpacing();
+  if (!config.display.spacing || !pairs.length) return;
+  const pos = [];
+  for (const p of pairs) {
+    const a = rigCams[p.i].body.position, b = rigCams[p.j].body.position;
+    pos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    const div = document.createElement('div'); div.className = 'lbl lbl-dist'; div.textContent = fmtLen(p.d);
+    const lbl = new CSS2DObject(div);
+    lbl.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+    scene.add(lbl); spacingLabels.push(lbl);
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  spacingLines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.55 }));
+  spacingLines.raycast = () => {};
+  scene.add(spacingLines);
+}
+
+// Camera ID labels, out-of-room flags, nearest-neighbor spacing overlay + readouts.
+function updateMeasurements() {
+  const n = rigCams.length;
+  let outside = 0;
+  rigCams.forEach((rc, i) => {
+    if (rc.labelDiv) { rc.labelDiv.textContent = `CAM ${i + 1}`; rc.label.visible = config.display.camLabels; }
+    const out = cameraOutsideRoom(rc.body.position);
+    if (out) outside++;
+    rc.body.material = out ? camBodyMatOutside : (rc.solo ? camBodyMatSolo : camBodyMat);
+  });
+  // Nearest-neighbour distances (for the readout) + the pairs to DRAW (nearest, or every pair).
+  const dists = [];
+  for (let i = 0; i < n; i++) {
+    const pi = rigCams[i].body.position; let nd = Infinity;
+    for (let j = 0; j < n; j++) if (j !== i) nd = Math.min(nd, pi.distanceTo(rigCams[j].body.position));
+    if (nd < Infinity) dists.push(nd);
+  }
+  const pairs = [];
+  if (config.display.spacingMode === 'all') {
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pairs.push({ i, j, d: rigCams[i].body.position.distanceTo(rigCams[j].body.position) });
+  } else {
+    const seen = new Set();
+    for (let i = 0; i < n; i++) {
+      const pi = rigCams[i].body.position; let nn = -1, nd = Infinity;
+      for (let j = 0; j < n; j++) { if (j === i) continue; const d = pi.distanceTo(rigCams[j].body.position); if (d < nd) { nd = d; nn = j; } }
+      if (nn >= 0) { const a = Math.min(i, nn), b = Math.max(i, nn), k = a + '-' + b; if (!seen.has(k)) { seen.add(k); pairs.push({ i: a, j: b, d: nd }); } }
+    }
+  }
+  buildSpacing(pairs);
+  ensureTripods(); syncTripods();
+  $('mRadius').textContent = fmtLen(config.rig.radius);
+  if (n) { const hs = rigCams.map(rc => rc.body.position.y); $('mHeight').textContent = `${fmtLen(Math.min(...hs))} / ${fmtLen(hs.reduce((a, b) => a + b, 0) / n)} / ${fmtLen(Math.max(...hs))}`; }
+  else $('mHeight').textContent = '—';
+  if (dists.length) {
+    const mn = Math.min(...dists), mx = Math.max(...dists), mean = dists.reduce((a, b) => a + b, 0) / dists.length;
+    $('mSpacing').textContent = `${fmtLen(mn)} / ${fmtLen(mean)} / ${fmtLen(mx)}`;
+  } else $('mSpacing').textContent = '—';
+  const oEl = $('mOutside');
+  oEl.textContent = config.room.enabled ? (outside ? `${outside} ⚠` : '0 ✓') : 'room off';
+  oEl.style.color = config.room.enabled ? (outside > 0 ? 'var(--hm-fixable)' : 'var(--hm-good)') : 'var(--text-dim)';
+}
+
+// Largest dome radius that fits inside the room (small margin), then redistribute.
+function fitDomeToRoom() {
+  const [W, H, D] = config.room.size;
+  config.rig.radius = +Math.max(0.5, Math.min(W / 2, D / 2, H) - 0.15).toFixed(3);
+  $('radius').value = config.rig.radius;
+  distributeCameras(); scheduleReachability();
+  toast(`Dome radius set to ${fmtLen(config.rig.radius)}`);
+}
+
+// Tripod lines (camera → floor) + per-camera height labels. The geometry/labels are (re)built only
+// when the camera count or toggle changes; positions/heights are synced every frame (live on drag).
+let tripodLines = null, heightLabels = [];
+const tripodMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+
+function clearTripods() {
+  if (tripodLines) { scene.remove(tripodLines); tripodLines.geometry.dispose(); tripodLines = null; }
+  for (const l of heightLabels) { scene.remove(l); if (l.element && l.element.parentNode) l.element.parentNode.removeChild(l.element); }
+  heightLabels = [];
+}
+
+function ensureTripods() {
+  if (!config.display.tripods) { if (tripodLines || heightLabels.length) clearTripods(); return; }
+  if (tripodLines && heightLabels.length === rigCams.length) return;   // structure already matches
+  clearTripods();
+  const n = rigCams.length;
+  if (!n) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(n * 6), 3));
+  tripodLines = new THREE.LineSegments(geo, tripodMat);
+  tripodLines.raycast = () => {};
+  tripodLines.frustumCulled = false;   // positions are updated in place each frame
+  scene.add(tripodLines);
+  for (let i = 0; i < n; i++) {
+    const div = document.createElement('div'); div.className = 'lbl lbl-height';
+    const lbl = new CSS2DObject(div); lbl.userData.lastText = '';
+    scene.add(lbl); heightLabels.push(lbl);
+  }
+}
+
+function syncTripods() {
+  if (!tripodLines || !config.display.tripods) return;
+  const arr = tripodLines.geometry.attributes.position.array;
+  for (let i = 0; i < rigCams.length && i < heightLabels.length; i++) {
+    const p = rigCams[i].body.position, o = i * 6;
+    arr[o] = p.x; arr[o + 1] = p.y; arr[o + 2] = p.z;          // camera
+    arr[o + 3] = p.x; arr[o + 4] = 0; arr[o + 5] = p.z;        // straight down to the floor
+    const lbl = heightLabels[i];
+    lbl.position.set(p.x, p.y * 0.5, p.z);
+    const t = fmtLen(p.y);
+    if (t !== lbl.userData.lastText) { lbl.element.textContent = t; lbl.userData.lastText = t; }
+  }
+  tripodLines.geometry.attributes.position.needsUpdate = true;
+}
+
+// ============================================================================
+//  PDF report export (jsPDF loaded on demand so the app never depends on it)
+// ============================================================================
+function loadJsPDF() {
+  if (window.jspdf && window.jspdf.jsPDF) return Promise.resolve(window.jspdf.jsPDF);
+  if (!window._jspdfP) {
+    window._jspdfP = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/jspdf@2.5.2/dist/jspdf.umd.min.js';
+      // Clear the cache on any failure so a later click re-injects the script (transient-blip recovery).
+      s.onload = () => { if (window.jspdf && window.jspdf.jsPDF) resolve(window.jspdf.jsPDF); else { window._jspdfP = null; reject(new Error('jsPDF global missing')); } };
+      s.onerror = () => { window._jspdfP = null; reject(new Error('jsPDF load failed')); };
+      document.head.appendChild(s);
+    });
+  }
+  return window._jspdfP;
+}
+
+// Render the WebGL view to a PNG. topDown temporarily lifts the camera for a floor plan.
+function captureView(topDown) {
+  let saved = null;
+  if (topDown) {
+    saved = { pos: viewCam.position.clone(), quat: viewCam.quaternion.clone(), up: viewCam.up.clone() };
+    const c = controls.target;
+    const span = Math.max(config.room.size[0], config.room.size[2], config.rig.radius * 2, 2);
+    viewCam.up.set(0, 0, -1);
+    viewCam.position.set(c.x, c.y + span * 2.0, c.z);
+    viewCam.lookAt(c.x, 0, c.z);
+    viewCam.updateProjectionMatrix(); viewCam.updateMatrixWorld(true);
+  }
+  renderer.render(scene, viewCam);
+  const url = renderer.domElement.toDataURL('image/png');
+  if (saved) {
+    viewCam.position.copy(saved.pos); viewCam.quaternion.copy(saved.quat); viewCam.up.copy(saved.up);
+    viewCam.updateProjectionMatrix(); viewCam.updateMatrixWorld(true);
+    renderer.render(scene, viewCam);
+  }
+  return url;
+}
+
+async function exportPDF() {
+  toast('Generating PDF…');
+  let JsPDF;
+  try { JsPDF = await loadJsPDF(); if (!JsPDF) throw 0; }
+  catch (e) { console.error(e); toast('PDF failed: could not load jsPDF (offline?)'); return; }
+  if (EVAL) computeCoverage();                 // make sure scores + heatmap are current
+  const imgPersp = captureView(false);
+  const imgPlan = captureView(true);
+  const aspect = renderer.domElement.width / renderer.domElement.height;
+
+  const doc = new JsPDF({ unit: 'pt', format: 'a4', compress: true });
+  const PW = doc.internal.pageSize.getWidth(), PH = doc.internal.pageSize.getHeight(), M = 40;
+  let y = M;
+  const uL = config.display.units, uNum = m => (uL === 'ft' ? m / M_PER_FT : m).toFixed(2);
+  // Standard jsPDF fonts are Latin-1 only — strip/replace anything outside that range.
+  const asc = s => String(s).replace(/[^\x20-\x7E]/g, c => ({ '≥': '>=', '–': '-', '—': '-', '×': 'x', '·': '-', '✓': ' ok', '⚠': ' !', 'Δ': '', '°': 'deg' }[c] || ''));
+  const txt = id => asc($(id) ? $(id).textContent : '-');
+  const ensure = s => { if (y + s > PH - M) { doc.addPage(); y = M; } };
+  const h1 = t => { ensure(30); doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor(24, 24, 30); doc.text(asc(t), M, y); y += 7; doc.setDrawColor(239, 115, 22); doc.setLineWidth(1.5); doc.line(M, y, PW - M, y); y += 15; };
+  const row = (l, v) => { ensure(13); doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(95, 95, 103); doc.text(asc(l), M, y); doc.setTextColor(22, 22, 28); doc.text(asc(v), M + 210, y); y += 12.5; };
+  const trow = (cells, w, bold) => { ensure(12); doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(8); doc.setTextColor(bold ? 22 : 70, bold ? 22 : 70, bold ? 28 : 76); let x = M; cells.forEach((c, i) => { doc.text(asc(c), x, y); x += w[i]; }); y += 11.5; };
+  const table = (header, w, rows) => { trow(header, w, true); for (const r of rows) { if (y + 12 > PH - M) { doc.addPage(); y = M; trow(header, w, true); } trow(r, w); } };
+  const para = t => { doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(120, 120, 128); const ls = doc.splitTextToSize(asc(t), PW - 2 * M); ensure(ls.length * 10 + 4); doc.text(ls, M, y); y += ls.length * 10 + 6; };
+  const addImg = (data, maxH) => { let w = PW - 2 * M, h = w / aspect; if (h > maxH) { h = maxH; w = h * aspect; } ensure(h + 6); doc.addImage(data, 'PNG', M + (PW - 2 * M - w) / 2, y, w, h); y += h + 6; };
+
+  // Title
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(18); doc.setTextColor(24, 24, 30);
+  doc.text('Siren Capture Planner - Rig Report', M, y); y += 19;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(120, 120, 128);
+  doc.text(asc(`Generated ${new Date().toLocaleString()} | ${rigCams.length} cameras | units: ${uL}`), M, y); y += 6;
+  doc.setDrawColor(239, 68, 68); doc.setLineWidth(2); doc.line(M, y, PW - M, y); y += 16;
+
+  addImg(imgPersp, 300);
+  doc.setFontSize(7.5); doc.setTextColor(120, 120, 128);
+  doc.text(asc('Perspective view (room, dome, cameras, frustums, tripods, heatmap). Floating labels are tabulated below.'), M, y); y += 14;
+
+  h1('Coverage score');
+  if (rigCams.some(rc => rc.solo)) row('NOTE', 'Solo active - scores reflect the soloed subset only');
+  row('GOOD% (>=2 cam, usable parallax)', txt('goodPct') + ' %');
+  row('GOOD', txt('goodVal')); row('WIDE_ONLY', txt('wideVal')); row('LOW_PARALLAX', txt('lowVal'));
+  row('SINGLE (billboards)', txt('singleVal')); row('HOLE - fixable', txt('holeFixVal')); row('HOLE - unfixable (infill)', txt('holeUnfixVal'));
+
+  h1('Connectivity');
+  row('Components', txt('componentsVal')); row('Edges', txt('edgesVal')); row('Weakest bridge', txt('bridgeVal'));
+
+  if (config.roi.enabled) {
+    h1('Region of interest');
+    row('ROI GOOD%', txt('roiGoodVal')); row('Shape', config.roi.shape);
+    row('Center (x,y,z)', config.roi.center.map(uNum).join(', ') + ' ' + uL);
+    row('Size / radius', config.roi.size.map(uNum).join(', ') + ' ' + uL);
+  }
+
+  h1('Room & measurements');
+  const outside = rigCams.filter(rc => cameraOutsideRoom(rc.body.position)).length;
+  row('Room W x H x D', config.room.size.map(uNum).join(' x ') + ' ' + uL + (config.room.enabled ? '' : ' (off)'));
+  row('Dome radius', txt('mRadius'));
+  row('Cam spacing min/mean/max', txt('mSpacing'));
+  row('Cam height min/mean/max', txt('mHeight'));
+  row('Cameras outside room', config.room.enabled ? `${outside}${outside ? ' (outside!)' : ' (all inside)'}` : 'room off');
+
+  h1('Floor plan (top-down)');
+  addImg(imgPlan, 300);
+
+  h1('Cameras');
+  const cw = [38, 72, 72, 72, 66, 90];
+  const margCells = document.querySelectorAll('#cam-list .cam-marg');
+  const camRows = rigCams.map((rc, i) => {
+    const p = rc.body.position;
+    const st = [rc.locked ? 'locked' : '', rc.solo ? 'solo' : '', cameraOutsideRoom(p) ? 'OUTSIDE' : ''].filter(Boolean).join(' ') || 'ok';
+    return [`${i + 1}`, uNum(p.x), uNum(p.y), uNum(p.z), margCells[i] ? margCells[i].textContent : '-', st];
+  });
+  table(['CAM', `X (${uL})`, `Height (${uL})`, `Z (${uL})`, 'Marginal', 'Status'], cw, camRows);
+
+  h1('Camera-to-camera spacing (all pairs)');
+  const sw = [150, 120], spRows = [];
+  for (let i = 0; i < rigCams.length; i++) for (let j = i + 1; j < rigCams.length; j++) {
+    spRows.push([`CAM ${i + 1} - CAM ${j + 1}`, uNum(rigCams[i].body.position.distanceTo(rigCams[j].body.position))]);
+  }
+  table(['Pair', `Distance (${uL})`], sw, spRows);
+
+  h1('Configuration');
+  row('Subject', `${config.subject.type}, len/h ${uNum(config.subject.lengthOrHeight)} ${uL}, thickness ${uNum(config.subject.bodyThickness)} ${uL}, ${config.subject.sampleCount} samples`);
+  row('Bed', `${config.bed.size.map(uNum).join(' x ')} ${uL}, top ${uNum(config.bed.topY)} ${uL}${config.bed.enabled ? '' : ' (off)'}`);
+  row('Rig', `${config.rig.topology}, radius ${uNum(config.rig.radius)} ${uL}, min height ${uNum(config.rig.minCameraHeight)} ${uL}, arc ${config.rig.arcSpanDeg} deg`);
+  row('Look-at (x,y,z)', config.rig.lookAt.map(uNum).join(', ') + ' ' + uL);
+  row('Intrinsics', `fovH ${config.camera.fovHDeg} deg / fovV ${fovVdeg().toFixed(1)} deg, aspect ${config.camera.aspect.toFixed(3)}, near ${uNum(config.camera.near)} / far ${uNum(config.camera.far)} ${uL}`);
+  row('Matcher', `${config.matcher.preset}: parallax ${config.matcher.minParallaxDeg}-${config.matcher.maxParallaxDeg} deg, grazing ${config.matcher.grazingLimitDeg} deg, min edge ${config.matcher.minEdgePoints}`);
+
+  h1('Notes');
+  para('GOOD% is the area-weighted fraction of the subject surface seen by 2+ cameras at usable parallax. SINGLE regions billboard; HOLE-unfixable is occluded from the whole allowed dome and needs generative infill, not more cameras. This tool plans GEOMETRIC coverage only - textureless/specular surfaces, hair, thin structures, subject motion, and lighting are not modelled, so a high score is necessary but not sufficient for a clean reconstruction. Thresholds are heuristics; tune them to your own results.');
+
+  doc.save('siren-rig-report.pdf');
+  toast('PDF report downloaded');
+}
+
+// ============================================================================
+//  Rig cameras — each is { persp, body(+frustum child), target, solo, locked }
+// ============================================================================
+const rigCams = [];
+let dragControls = null;
+
+// Camera gizmo: body box sits BEHIND (+Z), lens barrel protrudes toward the view direction (-Z),
+// which aimGizmo() aligns with the real camera's -Z look axis at the subject. Reads as
+// "camera here, looking that way".
+const camBodyGeo = (() => {
+  const body = new THREE.BoxGeometry(0.12, 0.085, 0.10); body.translate(0, 0, 0.05);                 // body, behind the lens
+  const lens = new THREE.CylinderGeometry(0.034, 0.046, 0.07, 22); lens.rotateX(d2r(90)); lens.translate(0, 0, -0.025); // lens barrel, opening toward -Z
+  return mergeGeometries([body, lens], false);
+})();
+const camBodyMat = new THREE.MeshStandardMaterial({ color: 0xf97316, emissive: 0x7a2e05, emissiveIntensity: 0.55, roughness: 0.45, metalness: 0.3 });
+const camBodyMatSolo = new THREE.MeshStandardMaterial({ color: 0xfbbf24, emissive: 0x8a4a00, emissiveIntensity: 0.85, roughness: 0.4, metalness: 0.3 });
+const frustumMat = new THREE.LineBasicMaterial({ color: 0xf9a06b, transparent: true, opacity: 0.5 });
+const frustumMatLocked = new THREE.LineBasicMaterial({ color: 0x6b7280, transparent: true, opacity: 0.55 });
+
+function buildFrustumGeometry() {
+  const fovV = d2r(fovVdeg());
+  const L = CAM_VIZ_LEN;
+  const hH = Math.tan(fovV / 2) * L;
+  const hW = hH * config.camera.aspect;
+  const A = [0, 0, 0], TL = [-hW, hH, -L], TR = [hW, hH, -L], BR = [hW, -hH, -L], BL = [-hW, -hH, -L];
+  const seg = [A, TL, A, TR, A, BR, A, BL, TL, TR, TR, BR, BR, BL, BL, TL];
+  return new THREE.BufferGeometry().setFromPoints(seg.map(p => new THREE.Vector3(...p)));
+}
+
+function createRigCamera(pos, target) {
+  const body = new THREE.Mesh(camBodyGeo, camBodyMat);
+  body.position.copy(pos);
+  const frustum = new THREE.LineSegments(buildFrustumGeometry(), frustumMat);
+  frustum.name = 'frustum';
+  frustum.raycast = () => {};   // not a drag target — only the body mesh is grabbable
+  body.add(frustum);
+
+  const labelDiv = document.createElement('div'); labelDiv.className = 'lbl lbl-cam'; labelDiv.textContent = 'CAM';
+  const label = new CSS2DObject(labelDiv); label.position.set(0, 0.14, 0); label.visible = config.display.camLabels;
+  body.add(label);
+
+  const persp = new THREE.PerspectiveCamera(fovVdeg(), config.camera.aspect, config.camera.near, config.camera.far);
+
+  const rc = { body, frustum, persp, label, labelDiv, target: target.clone(), solo: false, locked: false };
+  body.userData.rc = rc;
+  aimGizmo(rc);
+  scene.add(body);
+  rigCams.push(rc);
+  return rc;
+}
+
+function syncPersp(rc) {
+  rc.persp.position.copy(rc.body.position);
+  rc.persp.up.set(0, 1, 0);
+  rc.persp.lookAt(rc.target);
+  rc.persp.fov = fovVdeg();
+  rc.persp.aspect = config.camera.aspect;
+  rc.persp.near = config.camera.near;
+  rc.persp.far = config.camera.far;
+  rc.persp.updateProjectionMatrix();
+  rc.persp.updateMatrixWorld(true);
+}
+
+// Orient the gizmo to match the REAL camera (which looks down -Z). Object3D.lookAt() on a plain
+// Mesh aims +Z at the target (opposite of camera convention), which pointed the lens/frustum the
+// wrong way — so copy the persp camera's orientation instead. Single source of truth.
+function aimGizmo(rc) {
+  syncPersp(rc);
+  rc.body.quaternion.copy(rc.persp.quaternion);
+}
+
+function disposeRigCamera(rc) {
+  scene.remove(rc.body);
+  rc.frustum.geometry.dispose();
+  if (rc.labelDiv && rc.labelDiv.parentNode) rc.labelDiv.parentNode.removeChild(rc.labelDiv);   // drop the CSS2D label DOM node
+}
+
+function clearRigCameras() {
+  while (rigCams.length) disposeRigCamera(rigCams.pop());
+}
+
+// --- Placement on the allowed manifold -------------------------------------
+// Enforce world-Y >= minCameraHeight AND keep the point on the rig sphere of `radius`.
+function finalizeOnDome(pos) {
+  const c = config.rig;
+  const cx = config.bed.center[0], cy = 0, cz = config.bed.center[2];
+  let dx = pos.x - cx, dy = pos.y - cy, dz = pos.z - cz;
+  let worldY = pos.y;
+  if (worldY < c.minCameraHeight) worldY = c.minCameraHeight;
+  dy = worldY - cy;
+  let horiz2 = c.radius * c.radius - dy * dy;
+  const horiz = horiz2 > 0 ? Math.sqrt(horiz2) : 0;
+  const ang = Math.atan2(dz, dx);
+  pos.set(cx + horiz * Math.cos(ang), worldY, cz + horiz * Math.sin(ang));
+  return pos;
+}
+
+function domePoint(i, n) {
+  // Fibonacci hemisphere, y in [yMin..1], snapped to rig sphere & min height.
+  const c = config.rig;
+  const yMinUnit = Math.min(0.98, Math.max(-0.99, c.minCameraHeight / c.radius));
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const y = yMinUnit + (1 - yMinUnit) * ((i + 0.5) / n);
+  const rad = Math.sqrt(Math.max(0, 1 - y * y));
+  const theta = i * golden;
+  const pos = new THREE.Vector3(
+    config.bed.center[0] + c.radius * Math.cos(theta) * rad,
+    c.radius * y,
+    config.bed.center[2] + c.radius * Math.sin(theta) * rad,
+  );
+  return finalizeOnDome(pos);
+}
+
+function spherePoint(i, n) {
+  const c = config.rig;
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const y = 1 - (i + 0.5) / n * 2;          // 1..-1
+  const rad = Math.sqrt(Math.max(0, 1 - y * y));
+  const theta = i * golden;
+  const pos = new THREE.Vector3(
+    config.bed.center[0] + c.radius * Math.cos(theta) * rad,
+    c.radius * y,
+    config.bed.center[2] + c.radius * Math.sin(theta) * rad,
+  );
+  return finalizeOnDome(pos); // clamps below-min points up onto the dome
+}
+
+function ringPoint(i, n, elevDeg) {
+  const c = config.rig;
+  const span = d2r(c.arcSpanDeg);
+  const a = n > 1 ? -span / 2 + span * (i / (c.arcSpanDeg >= 360 ? n : (n - 1))) : 0;
+  const elev = d2r(elevDeg);
+  const y = Math.max(c.minCameraHeight, c.radius * Math.sin(elev));
+  const dy = y;
+  let horiz = Math.sqrt(Math.max(0, c.radius * c.radius - dy * dy));
+  // Degenerate rig (minCameraHeight >= radius): keep a small spread ring rather than
+  // stacking every camera on the vertical axis. Min-height is still honored.
+  if (horiz < 1e-3) horiz = c.radius * 0.1;
+  const pos = new THREE.Vector3(
+    config.bed.center[0] + horiz * Math.cos(a),
+    y,
+    config.bed.center[2] + horiz * Math.sin(a),
+  );
+  return pos;
+}
+
+function makePoint(i, n) {
+  switch (config.rig.topology) {
+    case 'sphere': return spherePoint(i, n);
+    case 'ring':   return ringPoint(i, n, 22);
+    case 'arc':    return ringPoint(i, n, 28);
+    case 'dome':
+    default:       return domePoint(i, n);
+  }
+}
+
+function distributeCameras() {
+  // Preserve solo/lock state by index where possible.
+  const prev = rigCams.map(rc => ({ solo: rc.solo, locked: rc.locked }));
+  clearRigCameras();
+  const n = Math.max(0, Math.floor(config.rig.cameraCount));
+  const target = new THREE.Vector3(...config.rig.lookAt);
+  for (let i = 0; i < n; i++) {
+    const rc = createRigCamera(makePoint(i, n), target);
+    if (prev[i]) { rc.solo = prev[i].solo; rc.locked = prev[i].locked; }
+    applyCamStyle(rc);
+  }
+  rebuildDrag();
+  refreshCameraList();
+  updateHUD();
+  scheduleCoverage(0);
+}
+
+function addCamera() {
+  const n = rigCams.length;
+  const target = new THREE.Vector3(...config.rig.lookAt);
+  // Place the new camera on the ACTIVE topology's manifold (consistent with the rest of the rig).
+  const rc = createRigCamera(makePoint(n, n + 1), target);
+  config.rig.cameraCount = rigCams.length;
+  applyCamStyle(rc);
+  rebuildDrag();
+  refreshCameraList();
+  updateHUD();
+  scheduleCoverage(0);
+  toast(`Added camera ${rigCams.length}`);
+}
+
+function removeCamera(rc) {
+  const idx = rigCams.indexOf(rc);
+  if (idx === -1) return;
+  disposeRigCamera(rc);
+  rigCams.splice(idx, 1);
+  config.rig.cameraCount = rigCams.length;
+  rebuildDrag();
+  refreshCameraList();
+  updateHUD();
+  scheduleCoverage(0);
+}
+
+function applyCamStyle(rc) {
+  // Single source of truth for body color: outside-room (red) > solo (amber) > normal (orange).
+  rc.body.material = cameraOutsideRoom(rc.body.position) ? camBodyMatOutside : (rc.solo ? camBodyMatSolo : camBodyMat);
+  rc.frustum.material = rc.locked ? frustumMatLocked : frustumMat;
+}
+
+// Rebuild frustum line geometry for all cameras (after fov/aspect change).
+function rebuildAllFrustums() {
+  for (const rc of rigCams) {
+    rc.frustum.geometry.dispose();
+    rc.frustum.geometry = buildFrustumGeometry();
+    syncPersp(rc);
+  }
+}
+
+// ============================================================================
+//  Drag controls (camera gizmos) — height hard-clamped to >= minCameraHeight
+// ============================================================================
+function rebuildDrag() {
+  if (dragControls) dragControls.dispose();
+  const draggable = rigCams.filter(rc => !rc.locked).map(rc => rc.body);
+  if (config.roi.enabled && roiMesh) draggable.push(roiMesh);   // the ROI region handle is draggable too
+  dragControls = new DragControls(draggable, viewCam, renderer.domElement);
+  dragControls.recursive = false;   // pick only the body meshes, never their frustum children
+  dragControls.addEventListener('dragstart', () => { controls.enabled = false; });
+  dragControls.addEventListener('dragend', () => { controls.enabled = true; updateHUD(); scheduleCoverage(0); });
+  dragControls.addEventListener('drag', (e) => {
+    if (e.object.userData.roi) {   // dragging the ROI region — update its center, no height clamp
+      config.roi.center = [e.object.position.x, e.object.position.y, e.object.position.z];
+      syncROIFields();
+      scheduleCoverage(120);
+      return;
+    }
+    const rc = e.object.userData.rc;
+    // Hard min-height constraint (SPEC: never below minCameraHeight).
+    if (e.object.position.y < config.rig.minCameraHeight) e.object.position.y = config.rig.minCameraHeight;
+    aimGizmo(rc);                 // keep aimed at the subject
+    scheduleCoverage(120);        // debounced live heatmap while dragging
+  });
+}
+
+// ============================================================================
+//  UI wiring
+// ============================================================================
+const $ = id => document.getElementById(id);
+
+function refreshCameraList() {
+  const list = $('cam-list');
+  list.innerHTML = '';
+  if (!rigCams.length) {
+    list.innerHTML = '<div class="cam-empty">No cameras. Use “+ Add” or Auto-distribute.</div>';
+  }
+  rigCams.forEach((rc, i) => {
+    const item = document.createElement('div');
+    item.className = 'cam-item';
+    item.innerHTML = `
+      <span class="cam-dot" style="background:${rc.solo ? '#fbbf24' : '#f97316'}"></span>
+      <span class="cam-name">CAM ${i + 1}</span>
+      <span class="cam-marg" title="Marginal GOOD% — lost if this camera is removed">—</span>
+      <label class="tog" title="Solo: paint only this camera's coverage"><input type="checkbox" class="solo" ${rc.solo ? 'checked' : ''}>solo</label>
+      <label class="tog" title="Lock pins the camera (no drag)"><input type="checkbox" class="lock" ${rc.locked ? 'checked' : ''}>lock</label>
+      <button class="cam-x" title="Remove">×</button>`;
+    item.querySelector('.solo').addEventListener('change', (ev) => {
+      rc.solo = ev.target.checked; applyCamStyle(rc);
+      item.querySelector('.cam-dot').style.background = rc.solo ? '#fbbf24' : '#f97316';
+      scheduleCoverage(0);
+    });
+    item.querySelector('.lock').addEventListener('change', (ev) => {
+      rc.locked = ev.target.checked; applyCamStyle(rc); rebuildDrag(); updateMeasurements();
+    });
+    item.querySelector('.cam-x').addEventListener('click', () => removeCamera(rc));
+    list.appendChild(item);
+  });
+  $('camCount').textContent = rigCams.length;
+}
+
+function updateHUD() {
+  $('hudCount').textContent = rigCams.length;
+  const ok = rigCams.every(rc => rc.body.position.y >= config.rig.minCameraHeight - 1e-4);
+  const el = $('hudHeight');
+  el.textContent = ok ? '✓' : '✗ below min';
+  el.className = ok ? 'ok' : 'bad';
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 1600);
+}
+
+// --- Push config -> form fields --------------------------------------------
+function syncFormFromConfig() {
+  $('subjectType').value = config.subject.type;
+  $('subjLen').value = config.subject.lengthOrHeight;
+  $('subjThick').value = config.subject.bodyThickness;
+  $('bedW').value = config.bed.size[0]; $('bedH').value = config.bed.size[1]; $('bedL').value = config.bed.size[2];
+  $('sampleCount').value = config.subject.sampleCount;
+  $('topology').value = config.rig.topology;
+  $('radius').value = config.rig.radius;
+  $('minHeight').value = config.rig.minCameraHeight;
+  $('arcSpan').value = config.rig.arcSpanDeg;
+  $('lookX').value = config.rig.lookAt[0]; $('lookY').value = config.rig.lookAt[1]; $('lookZ').value = config.rig.lookAt[2];
+  $('fovH').value = config.camera.fovHDeg;
+  $('aspect').value = +config.camera.aspect.toFixed(4);
+  $('near').value = config.camera.near; $('far').value = config.camera.far;
+  $('matcherPreset').value = config.matcher.preset;
+  $('minPar').value = config.matcher.minParallaxDeg; $('maxPar').value = config.matcher.maxParallaxDeg;
+  $('grazing').value = config.matcher.grazingLimitDeg; $('minEdge').value = config.matcher.minEdgePoints;
+  setParallaxEditable(config.matcher.preset === 'custom');
+  $('optIters').value = config.optimizer.iterations;
+  $('optSep').value = config.optimizer.minCamSeparationDeg;
+  $('roomEnabled').checked = config.room.enabled;
+  $('units').value = config.display.units;
+  syncRoomFields();
+  $('showCamLabels').checked = config.display.camLabels;
+  $('showSpacing').checked = config.display.spacing;
+  $('spacingMode').value = config.display.spacingMode;
+  $('showTripods').checked = config.display.tripods;
+  syncROIFields();
+}
+
+function setParallaxEditable(on) {
+  $('minPar').disabled = !on; $('maxPar').disabled = !on;
+}
+
+const num = (id, fallback) => { const v = parseFloat($(id).value); return Number.isFinite(v) ? v : fallback; };
+
+// --- Field listeners --------------------------------------------------------
+function wireUI() {
+  // Subject / bed (rebuild geometry; cameras keep their targets but re-aim if look-at unchanged)
+  $('subjectType').addEventListener('change', e => { config.subject.type = e.target.value; buildSubject(); });
+  $('subjLen').addEventListener('change', () => { config.subject.lengthOrHeight = num('subjLen', 1.7); buildSubject(); });
+  $('subjThick').addEventListener('change', () => { config.subject.bodyThickness = num('subjThick', 0.28); buildSubject(); });
+  $('sampleCount').addEventListener('change', () => { config.subject.sampleCount = Math.max(100, Math.round(num('sampleCount', 2000))); buildSubject(); });
+  const onBed = () => {
+    config.bed.size = [num('bedW', 1.5), num('bedH', 0.6), num('bedL', 2.0)];
+    config.bed.topY = config.bed.size[1]; // mattress top = box height (base at y=0)
+    buildBed(); buildSubject();
+  };
+  ['bedW', 'bedH', 'bedL'].forEach(id => $(id).addEventListener('change', onBed));
+
+  // Rig
+  $('topology').addEventListener('change', e => { config.rig.topology = e.target.value; distributeCameras(); });
+  $('radius').addEventListener('change', () => { config.rig.radius = Math.max(0.5, num('radius', 2.5)); distributeCameras(); scheduleReachability(); });
+  $('arcSpan').addEventListener('change', () => { config.rig.arcSpanDeg = Math.min(360, Math.max(10, num('arcSpan', 360))); distributeCameras(); });
+  $('minHeight').addEventListener('change', () => {
+    config.rig.minCameraHeight = Math.max(0, num('minHeight', 0.6));
+    // Lift any existing camera that now violates the constraint back onto the dome.
+    for (const rc of rigCams) {
+      if (rc.body.position.y < config.rig.minCameraHeight) {
+        finalizeOnDome(rc.body.position); aimGizmo(rc);
+      }
+    }
+    updateHUD();
+    scheduleCoverage(0);
+    scheduleReachability();   // candidate dome min-height changed
+  });
+  const onLook = () => {
+    config.rig.lookAt = [num('lookX', 0), num('lookY', 0.72), num('lookZ', 0)];
+    controls.target.set(...config.rig.lookAt);
+    const t = new THREE.Vector3(...config.rig.lookAt);
+    for (const rc of rigCams) { rc.target.copy(t); aimGizmo(rc); }
+    scheduleCoverage(0);
+    scheduleReachability();   // candidate cameras aim at look-at
+  };
+  ['lookX', 'lookY', 'lookZ'].forEach(id => $(id).addEventListener('change', onLook));
+
+  // Intrinsics
+  $('fovH').addEventListener('change', () => { config.camera.fovHDeg = Math.min(170, Math.max(5, num('fovH', 60))); rebuildAllFrustums(); scheduleCoverage(0); scheduleReachability(); });
+  $('aspect').addEventListener('change', () => { config.camera.aspect = Math.max(0.1, num('aspect', 16 / 9)); rebuildAllFrustums(); scheduleCoverage(0); scheduleReachability(); });
+  $('near').addEventListener('change', () => { config.camera.near = Math.max(0.01, num('near', 0.1)); rigCams.forEach(syncPersp); scheduleCoverage(0); scheduleReachability(); });
+  $('far').addEventListener('change', () => { config.camera.far = Math.max(config.camera.near + 0.1, num('far', 10)); rigCams.forEach(syncPersp); scheduleCoverage(0); scheduleReachability(); });
+
+  // Camera count
+  $('btnAddCam').addEventListener('click', addCamera);
+  $('btnRemoveCam').addEventListener('click', () => { if (rigCams.length) removeCamera(rigCams[rigCams.length - 1]); });
+  $('btnDistribute').addEventListener('click', () => { config.rig.cameraCount = Math.max(1, rigCams.length || config.rig.cameraCount); distributeCameras(); toast('Cameras auto-distributed'); });
+  $('btnReset').addEventListener('click', resetAll);
+
+  // Matcher (M3 analysis; thresholds editable now)
+  $('matcherPreset').addEventListener('change', e => {
+    config.matcher.preset = e.target.value;
+    if (MATCHER_PRESETS[e.target.value]) Object.assign(config.matcher, MATCHER_PRESETS[e.target.value]);
+    syncFormFromConfig();
+    scheduleCoverage(0);   // parallax band changed → reclassify
+  });
+  $('minPar').addEventListener('change', () => { config.matcher.minParallaxDeg = num('minPar', 8); scheduleCoverage(0); });
+  $('maxPar').addEventListener('change', () => { config.matcher.maxParallaxDeg = num('maxPar', 45); scheduleCoverage(0); });
+  $('grazing').addEventListener('change', () => { config.matcher.grazingLimitDeg = num('grazing', 78); scheduleCoverage(0); scheduleReachability(); });
+  $('minEdge').addEventListener('change', () => { config.matcher.minEdgePoints = num('minEdge', 40); scheduleCoverage(0); });
+  $('showConn').addEventListener('change', e => { showConn = e.target.checked; scheduleCoverage(0); });
+
+  // Region of interest (M4)
+  $('roiEnabled').addEventListener('change', e => { config.roi.enabled = e.target.checked; buildROIGizmo(); scheduleCoverage(0); });
+  $('roiShape').addEventListener('change', e => { config.roi.shape = e.target.value; buildROIGizmo(); scheduleCoverage(0); });
+  $('roiPreset').addEventListener('change', e => {
+    if (e.target.value !== 'custom') { applyROIPreset(e.target.value); config.roi.enabled = true; }
+    syncROIFields(); buildROIGizmo(); scheduleCoverage(0);
+  });
+  const onRoiCenter = () => { config.roi.center = [num('roiCx', 0), num('roiCy', 0.85), num('roiCz', 0)]; if (roiMesh) roiMesh.position.set(...config.roi.center); scheduleCoverage(0); };
+  ['roiCx', 'roiCy', 'roiCz'].forEach(id => $(id).addEventListener('change', onRoiCenter));
+  const onRoiSize = () => { config.roi.size = [num('roiSx', 0.4), num('roiSy', 0.4), num('roiSz', 0.4)]; buildROIGizmo(); scheduleCoverage(0); };
+  ['roiSx', 'roiSy', 'roiSz'].forEach(id => $(id).addEventListener('change', onRoiSize));
+
+  // Optimizer & export (M5)
+  $('optIters').addEventListener('change', () => config.optimizer.iterations = Math.max(50, Math.floor(num('optIters', 1500))));
+  $('optSep').addEventListener('change', () => config.optimizer.minCamSeparationDeg = Math.max(0, num('optSep', 12)));
+  $('optRun').addEventListener('click', runOptimizer);
+  $('btnOptimize').addEventListener('click', runOptimizer);
+  $('optCancel').addEventListener('click', () => { if (_opt) _opt.cancel = true; });
+  $('optRevert').addEventListener('click', revertOptimizer);
+  $('optExport').addEventListener('click', exportExtrinsics);
+  $('exportPdf').addEventListener('click', exportPDF);
+
+  // Room & measurements
+  const onRoom = () => {
+    const toM = config.display.units === 'ft' ? M_PER_FT : 1;   // inputs are in the selected unit; store meters
+    config.room.enabled = $('roomEnabled').checked;
+    config.room.size = [Math.max(0.1, num('roomW', 4 / toM) * toM), Math.max(0.1, num('roomH', 2.6 / toM) * toM), Math.max(0.1, num('roomD', 4 / toM) * toM)];
+    buildRoom();
+  };
+  $('roomEnabled').addEventListener('change', onRoom);
+  ['roomW', 'roomH', 'roomD'].forEach(id => $(id).addEventListener('change', onRoom));
+  $('fitDome').addEventListener('click', fitDomeToRoom);
+  $('units').addEventListener('change', e => { config.display.units = e.target.value; syncRoomFields(); updateMeasurements(); });
+  $('showCamLabels').addEventListener('change', e => { config.display.camLabels = e.target.checked; updateMeasurements(); });
+  $('showSpacing').addEventListener('change', e => { config.display.spacing = e.target.checked; updateMeasurements(); });
+  $('spacingMode').addEventListener('change', e => { config.display.spacingMode = e.target.value; updateMeasurements(); });
+  $('showTripods').addEventListener('change', e => { config.display.tripods = e.target.checked; updateMeasurements(); });
+
+  // Config import/export
+  $('btnExport').addEventListener('click', exportConfig);
+  $('btnImport').addEventListener('click', () => $('fileImport').click());
+  $('fileImport').addEventListener('change', importConfig);
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f && /json$/i.test(f.name)) readConfigFile(f);
+  });
+}
+
+// --- Config persistence (JSON only — no localStorage) ----------------------
+function syncConfigCameras() {
+  config.rig.cameras = rigCams.map(rc => ({
+    pos: rc.body.position.toArray().map(v => +v.toFixed(4)),
+    target: rc.target.toArray().map(v => +v.toFixed(4)),
+    solo: rc.solo, locked: rc.locked,
+  }));
+  config.rig.cameraCount = rigCams.length;
+}
+
+function exportConfig() {
+  syncConfigCameras();
+  const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'siren-rig-config.json';
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Exported config JSON');
+}
+
+// Recursive merge so a partial/hand-edited config keeps every nested default
+// (a shallow Object.assign would replace whole sub-objects and drop sibling fields).
+function deepMerge(base, over) {
+  for (const k in over) {
+    const v = over[k];
+    if (v === null) continue;   // ignore explicit nulls so an imported config can't wipe required defaults
+    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) {
+      deepMerge(base[k], v);
+    } else {
+      base[k] = v;
+    }
+  }
+  return base;
+}
+
+function importConfig(e) { const f = e.target.files[0]; if (f) readConfigFile(f); e.target.value = ''; }
+function readConfigFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(reader.result);
+      config = deepMerge(structuredClone(DEFAULT_CONFIG), parsed);
+      rebuildFromConfig();
+      toast(`Imported ${file.name}`);
+    } catch (err) { toast('Import failed: invalid JSON'); console.error(err); }
+  };
+  reader.readAsText(file);
+}
+
+// ============================================================================
+//  Build / reset orchestration
+// ============================================================================
+function rebuildFromConfig() {
+  syncFormFromConfig();
+  buildBed();
+  buildSubject();
+  buildROIGizmo();
+  buildRoom();
+  controls.target.set(...config.rig.lookAt);
+
+  clearRigCameras();
+  if (Array.isArray(config.rig.cameras) && config.rig.cameras.length) {
+    // Restore explicit camera placements from an imported config.
+    for (const cam of config.rig.cameras) {
+      const rc = createRigCamera(new THREE.Vector3(...cam.pos), new THREE.Vector3(...(cam.target || config.rig.lookAt)));
+      rc.solo = !!cam.solo; rc.locked = !!cam.locked; applyCamStyle(rc);
+      if (rc.body.position.y < config.rig.minCameraHeight) { finalizeOnDome(rc.body.position); aimGizmo(rc); }
+    }
+    config.rig.cameraCount = rigCams.length;
+    rebuildDrag(); refreshCameraList(); updateHUD();
+  } else {
+    distributeCameras();
+  }
+}
+
+function resetAll() {
+  config = structuredClone(DEFAULT_CONFIG);
+  rebuildFromConfig();
+  toast('Reset to defaults');
+}
+
+// ============================================================================
+//  Render loop / resize
+// ============================================================================
+// Keep the left panel's lower edge above the legend (which sits at bottom:12px).
+function layoutPanels() {
+  const legendH = document.getElementById('legend').offsetHeight;
+  document.getElementById('panel-left').style.bottom = (12 + legendH + 12) + 'px';
+}
+
+function onResize() {
+  viewCam.aspect = window.innerWidth / window.innerHeight;
+  viewCam.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+  layoutPanels();
+}
+window.addEventListener('resize', onResize);
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  syncTripods();   // keep tripod lines + height labels glued to the cameras every frame
+  renderer.render(scene, viewCam);
+  labelRenderer.render(scene, viewCam);
+}
+
+// ============================================================================
+//  Boot
+// ============================================================================
+wireUI();
+rebuildFromConfig();
+layoutPanels();
+animate();
+
+// Expose for console poking during verification.
+window.SIREN = { config, rigCams, scene, distributeCameras, addCamera };
+</script>
+</body>
+</html>
