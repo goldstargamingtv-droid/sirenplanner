@@ -392,7 +392,7 @@
       <div class="bar-track" style="height:8px;margin-top:9px;"><div id="optBar" class="bar-fill" style="width:0%;background:var(--accent-grad)"></div></div>
       <div class="stat-line" style="margin-top:6px;"><span id="optStatus">idle</span><b id="optResult">—</b></div>
       <div class="btn-row"><button id="optExport" class="ghost" style="flex:1">⤓ Export camera extrinsics (JSON)</button></div>
-      <div class="btn-row"><button id="exportPdf" class="ghost" style="flex:1">⤓ Export PDF report (image + all measurements)</button></div>
+      <div class="btn-row"><button id="exportPdf" class="ghost" style="flex:1">⤓ Export setup guide (PDF)</button></div>
       <div class="hint">Simulated annealing nudges <b>unlocked</b> cameras over the dome to maximize GOOD% (ROI-weighted when ROI is on) minus graph fragmentation, respecting min separation &amp; min height. Locked cameras stay fixed. Searches on a reduced sample set; the result is re-scored at full resolution.</div>
     </div>
 
@@ -1564,75 +1564,110 @@ async function exportPDF() {
   const para = t => { doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(120, 120, 128); const ls = doc.splitTextToSize(asc(t), PW - 2 * M); ensure(ls.length * 10 + 4); doc.text(ls, M, y); y += ls.length * 10 + 6; };
   const addImg = (data, maxH) => { let w = PW - 2 * M, h = w / aspect; if (h > maxH) { h = maxH; w = h * aspect; } ensure(h + 6); doc.addImage(data, 'PNG', M + (PW - 2 * M - w) / 2, y, w, h); y += h + 6; };
 
-  // Title
-  doc.setFont('helvetica', 'bold'); doc.setFontSize(18); doc.setTextColor(24, 24, 30);
-  doc.text('Siren Capture Planner - Rig Report', M, y); y += 19;
-  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(120, 120, 128);
-  doc.text(asc(`Generated ${new Date().toLocaleString()} | ${rigCams.length} cameras | units: ${uL}`), M, y); y += 6;
-  doc.setDrawColor(239, 68, 68); doc.setLineWidth(2); doc.line(M, y, PW - M, y); y += 16;
+  // --- manual-style helpers ---
+  const subhead = t => { ensure(20); doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(239, 115, 22); doc.text(asc(t), M, y); y += 15; };
+  const caption = t => { doc.setFont('helvetica', 'italic'); doc.setFontSize(7.5); doc.setTextColor(130, 130, 138); const ls = doc.splitTextToSize(asc(t), PW - 2 * M); ensure(ls.length * 9 + 8); doc.text(ls, M, y); y += ls.length * 9 + 10; };
+  const bullet = t => { doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); const ls = doc.splitTextToSize(asc(t), PW - 2 * M - 16); ensure(ls.length * 12 + 4); doc.setFillColor(239, 115, 22); doc.circle(M + 4, y - 3, 1.6, 'F'); doc.setTextColor(45, 45, 52); doc.text(ls, M + 14, y); y += ls.length * 12 + 4; };
+  const callout = (big, label, lines, color) => {
+    const boxH = 58; ensure(boxH + 10);
+    doc.setFillColor(246, 247, 249); doc.roundedRect(M, y, PW - 2 * M, boxH, 6, 6, 'F');
+    doc.setFillColor(color[0], color[1], color[2]); doc.rect(M, y + 6, 4, boxH - 12, 'F');
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(26); doc.setTextColor(color[0], color[1], color[2]); doc.text(asc(big), M + 18, y + 33);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5); doc.setTextColor(110, 110, 118); doc.text(asc(label), M + 18, y + 46);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); doc.setTextColor(color[0], color[1], color[2]);
+    doc.text(doc.splitTextToSize(asc(lines), PW - 2 * M - 150), M + 135, y + 24);
+    y += boxH + 12;
+  };
+  const pv = id => asc($(id) ? $(id).textContent : '-').replace('%', '').trim();
+  const f = id => { const v = parseFloat(pv(id)); return Number.isFinite(v) ? v : 0; };
+  const bearing = (x, z) => { const cx = config.bed.center[0], cz = config.bed.center[2]; let deg = Math.atan2(x - cx, z - cz) * 180 / Math.PI; if (deg < 0) deg += 360; const clk = (Math.round(deg / 30) % 12) || 12; return `${clk} o'clock (${Math.round(deg)} deg)`; };
 
-  addImg(imgPersp, 300);
-  doc.setFontSize(7.5); doc.setTextColor(120, 120, 128);
-  doc.text(asc('Perspective view (room, dome, cameras, frustums, tripods, heatmap). Floating labels are tabulated below.'), M, y); y += 14;
+  // ===== Header band =====
+  doc.setFillColor(22, 22, 28); doc.rect(0, 0, PW, 60, 'F');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(255, 255, 255);
+  doc.text('CAMERA RIG SETUP GUIDE', M, 28);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(249, 140, 90);
+  doc.text('Siren Capture Planner', M, 42);
+  doc.setTextColor(188, 188, 196);
+  doc.text(asc(`${new Date().toLocaleDateString()}    |    ${rigCams.length} cameras    |    measurements in ${uL === 'ft' ? 'feet' : 'meters'}`), M, 52);
+  y = 78;
 
-  h1('Coverage score');
-  if (rigCams.some(rc => rc.solo)) row('NOTE', 'Solo active - scores reflect the soloed subset only');
-  row('GOOD% (>=2 cam, usable parallax)', txt('goodPct') + ' %');
-  row('GOOD', txt('goodVal')); row('WIDE_ONLY', txt('wideVal')); row('LOW_PARALLAX', txt('lowVal'));
-  row('SINGLE (billboards)', txt('singleVal')); row('HOLE - fixable', txt('holeFixVal')); row('HOLE - unfixable (infill)', txt('holeUnfixVal'));
+  // ===== Hero image =====
+  addImg(imgPersp, 226);
+  caption('Your rig at a glance: each orange marker is a camera on its stand, aimed at the subject. The shading on the body is the coverage map - green is good, orange is seen by only one camera, red/grey are gaps.');
 
-  h1('Connectivity');
-  row('Components', txt('componentsVal')); row('Edges', txt('edgesVal')); row('Weakest bridge', txt('bridgeVal'));
+  // ===== Verdict + plain english =====
+  const gv = f('goodVal'), sv = f('singleVal'), hf = f('holeFixVal');
+  let verdict, vColor;
+  if (sv >= 15 || hf >= 10) { verdict = 'NEEDS WORK: parts of the subject are under-covered - see the tips below.'; vColor = [220, 50, 50]; }
+  else if (gv >= 60) { verdict = 'STRONG: most of the reachable surface should reconstruct cleanly.'; vColor = [30, 150, 75]; }
+  else { verdict = 'OK: usable, but adding or moving a few cameras would help.'; vColor = [210, 150, 20]; }
+  callout(pv('goodPct') + '%', 'of the surface is reconstruction-ready', verdict, vColor);
 
-  if (config.roi.enabled) {
-    h1('Region of interest');
-    row('ROI GOOD%', txt('roiGoodVal')); row('Shape', config.roi.shape);
-    row('Center (x,y,z)', config.roi.center.map(uNum).join(', ') + ' ' + uL);
-    row('Size / radius', config.roi.size.map(uNum).join(', ') + ' ' + uL);
-  }
+  subhead('What this means (in plain terms)');
+  bullet(`${pv('goodVal')}% reconstructs well - seen by 2 or more cameras at a good angle. This is the number you want high.`);
+  bullet(`${pv('singleVal')}% is seen by only ONE camera, so it will look flat / cardboard. Add or move a camera toward those areas (orange on the model).`);
+  bullet(`${pv('holeFixVal')}% has no camera on it yet but a camera COULD reach it - add one aimed there (bright red on the model).`);
+  bullet(`${pv('holeUnfixVal')}% can't be seen from anywhere (blocked by the bed or the body). This needs AI fill-in later, not more cameras (dark grey on the model).`);
+  bullet((pv('componentsVal').charAt(0) === '1') ? 'All cameras overlap into one connected group - good for lining up and solving the shots.' : `Heads up: the cameras split into separate groups (${pv('componentsVal')}). Add overlap so every camera shares some view with a neighbour.`);
+  if (rigCams.some(rc => rc.solo)) bullet('Note: Solo is on, so these numbers reflect only the soloed camera(s), not the whole rig.');
 
-  h1('Room & measurements');
-  const outside = rigCams.filter(rc => cameraOutsideRoom(rc.body.position)).length;
-  row('Room W x H x D', config.room.size.map(uNum).join(' x ') + ' ' + uL + (config.room.enabled ? '' : ' (off)'));
-  row('Dome radius', txt('mRadius'));
-  row('Cam spacing min/mean/max', txt('mSpacing'));
-  row('Cam height min/mean/max', txt('mHeight'));
-  row('Ground dist to subject min/mean/max', txt('mGround'));
-  row('Cameras outside room', config.room.enabled ? `${outside}${outside ? ' (outside!)' : ' (all inside)'}` : 'room off');
-
-  h1('Floor plan (top-down)');
-  addImg(imgPlan, 300);
-
-  h1('Cameras');
-  const cw = [38, 72, 72, 72, 66, 90];
-  const margCells = document.querySelectorAll('#cam-list .cam-marg');
-  const camRows = rigCams.map((rc, i) => {
+  // ===== PAGE 2: stand placement =====
+  doc.addPage(); y = M;
+  h1('How to place each stand');
+  addImg(imgPlan, 210);
+  caption('Floor plan, looking straight down. The dot in the middle is the subject; each line is a camera stand and how far it sits from the subject.');
+  para('Setup steps: (1) Mark the subject position on the floor - that is the center. (2) Pick a front direction and call it 12 o\'clock. (3) For each camera in the table, measure the Floor distance straight out in the listed Direction, set up a tripod, raise the camera to the Camera height, and aim it at the subject.');
+  const cwB = [32, 92, 120, 96, 70];
+  const buildRows = rigCams.map((rc, i) => {
     const p = rc.body.position;
-    const st = [rc.locked ? 'locked' : '', rc.solo ? 'solo' : '', cameraOutsideRoom(p) ? 'OUTSIDE' : ''].filter(Boolean).join(' ') || 'ok';
-    return [`${i + 1}`, uNum(p.x), uNum(p.y), uNum(p.z), margCells[i] ? margCells[i].textContent : '-', st];
+    const gd = Math.hypot(p.x - config.bed.center[0], p.z - config.bed.center[2]);
+    const note = [rc.locked ? 'locked' : '', cameraOutsideRoom(p) ? 'OUTSIDE ROOM' : ''].filter(Boolean).join(' ');
+    return [`${i + 1}`, `${uNum(gd)} ${uL}`, bearing(p.x, p.z), `${uNum(p.y)} ${uL}`, note];
   });
-  table(['CAM', `X (${uL})`, `Height (${uL})`, `Z (${uL})`, 'Marginal', 'Status'], cw, camRows);
+  table(['CAM', 'Floor dist', 'Direction', 'Camera height', 'Notes'], cwB, buildRows);
+  caption('Floor dist = how far out from the subject to place the stand (measured on the ground). Direction = clock position around the subject (12 = your chosen front). Camera height = how high to set the camera off the floor.');
 
-  h1('Camera-to-camera spacing (all pairs)');
+  // ===== Reference =====
+  h1('Coverage details (reference)');
+  table(['Class', '% area', 'What it means'], [120, 64, 256], [
+    ['GOOD', pv('goodVal') + '%', 'Reconstructs well (2+ cams, good angle)'],
+    ['WIDE_ONLY', pv('wideVal') + '%', 'Seen by 2+ but far apart - matching risk'],
+    ['LOW_PARALLAX', pv('lowVal') + '%', 'Seen by 2+ but too close - weak depth'],
+    ['SINGLE', pv('singleVal') + '%', 'One camera only - looks flat'],
+    ['HOLE - fixable', pv('holeFixVal') + '%', 'No camera yet but reachable - add one'],
+    ['HOLE - unfixable', pv('holeUnfixVal') + '%', 'Blocked everywhere - needs AI fill-in'],
+  ]);
+
+  subhead('Distances & layout');
+  const outside = rigCams.filter(rc => cameraOutsideRoom(rc.body.position)).length;
+  row('Stand distance (min/avg/max)', txt('mGround'));
+  row('Camera height (min/avg/max)', txt('mHeight'));
+  row('Stand-to-stand spacing (min/avg/max)', txt('mSpacing'));
+  row('Room W x H x D', config.room.size.map(uNum).join(' x ') + ' ' + uL + (config.room.enabled ? '' : ' (off)'));
+  row('Cameras outside the room', config.room.enabled ? String(outside) : 'room not set');
+  row('Camera connection', txt('componentsVal') + ', weakest link ' + txt('bridgeVal'));
+  if (config.roi.enabled) row('Focus region coverage', txt('roiGoodVal'));
+
+  h1('Stand-to-stand spacing (reference)');
   const sw = [150, 120], spRows = [];
   for (let i = 0; i < rigCams.length; i++) for (let j = i + 1; j < rigCams.length; j++) {
-    spRows.push([`CAM ${i + 1} - CAM ${j + 1}`, uNum(rigCams[i].body.position.distanceTo(rigCams[j].body.position))]);
+    spRows.push([`CAM ${i + 1} - CAM ${j + 1}`, `${uNum(rigCams[i].body.position.distanceTo(rigCams[j].body.position))} ${uL}`]);
   }
-  table(['Pair', `Distance (${uL})`], sw, spRows);
+  table(['Pair', 'Distance'], sw, spRows);
 
-  h1('Configuration');
-  row('Subject', `${config.subject.type}, len/h ${uNum(config.subject.lengthOrHeight)} ${uL}, thickness ${uNum(config.subject.bodyThickness)} ${uL}, ${config.subject.sampleCount} samples`);
-  row('Bed', `${config.bed.size.map(uNum).join(' x ')} ${uL}, top ${uNum(config.bed.topY)} ${uL}${config.bed.enabled ? '' : ' (off)'}`);
-  row('Rig', `${config.rig.topology}, radius ${uNum(config.rig.radius)} ${uL}, min height ${uNum(config.rig.minCameraHeight)} ${uL}, arc ${config.rig.arcSpanDeg} deg`);
-  row('Look-at (x,y,z)', config.rig.lookAt.map(uNum).join(', ') + ' ' + uL);
-  row('Intrinsics', `fovH ${config.camera.fovHDeg} deg / fovV ${fovVdeg().toFixed(1)} deg, aspect ${config.camera.aspect.toFixed(3)}, near ${uNum(config.camera.near)} / far ${uNum(config.camera.far)} ${uL}`);
-  row('Matcher', `${config.matcher.preset}: parallax ${config.matcher.minParallaxDeg}-${config.matcher.maxParallaxDeg} deg, grazing ${config.matcher.grazingLimitDeg} deg, min edge ${config.matcher.minEdgePoints}`);
+  h1('Equipment & settings');
+  row('Cameras', `${rigCams.length} on a ${config.rig.topology} layout, ${config.rig.arcSpanDeg} deg arc`);
+  row('Lens', `fovH ${config.camera.fovHDeg} deg (vertical ${fovVdeg().toFixed(0)} deg), aspect ${config.camera.aspect.toFixed(3)}`);
+  row('Subject', `${config.subject.type.replace(/_/g, ' ')}, ${uNum(config.subject.lengthOrHeight)} ${uL} long`);
+  row('Bed', config.bed.enabled ? `${config.bed.size.map(uNum).join(' x ')} ${uL}` : 'off');
+  row('Matcher', `${config.matcher.preset.toUpperCase()} (parallax ${config.matcher.minParallaxDeg}-${config.matcher.maxParallaxDeg} deg)`);
 
-  h1('Notes');
-  para('GOOD% is the area-weighted fraction of the subject surface seen by 2+ cameras at usable parallax. SINGLE regions billboard; HOLE-unfixable is occluded from the whole allowed dome and needs generative infill, not more cameras. This tool plans GEOMETRIC coverage only - textureless/specular surfaces, hair, thin structures, subject motion, and lighting are not modelled, so a high score is necessary but not sufficient for a clean reconstruction. Thresholds are heuristics; tune them to your own results.');
+  h1('Good to know');
+  para('This guide plans where cameras GEOMETRICALLY see the subject. It does not account for texture, shiny or hair-like surfaces, motion, or lighting - so a high score is necessary but not a guarantee. "Unfixable" areas (dark grey) are blocked from every allowed camera position and are meant to be filled in with AI later (GEN3C / Difix3D+), not solved by adding hardware. Directions are clock positions viewed from above relative to the front you chose. All thresholds are starting points - tune them to your own results.');
 
-  doc.save('siren-rig-report.pdf');
-  toast('PDF report downloaded');
+  doc.save('siren-rig-setup-guide.pdf');
+  toast('Setup guide PDF downloaded');
 }
 
 // ============================================================================
