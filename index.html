@@ -127,6 +127,9 @@
   select { width: auto; min-width: 96px; }
   input:focus, select:focus { outline: none; border-color: var(--accent-orange); }
   input[type="checkbox"] { accent-color: var(--accent-orange); width: 14px; height: 14px; cursor: pointer; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; height: 4px; background: var(--field-border); border-radius: 3px; outline: none; cursor: pointer; padding: 0; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--accent-orange); cursor: pointer; }
+  input[type="range"]::-moz-range-thumb { width: 13px; height: 13px; border: none; border-radius: 50%; background: var(--accent-orange); cursor: pointer; }
 
   button {
     font-family: inherit; font-size: 11px; cursor: pointer; color: var(--text);
@@ -174,6 +177,7 @@
   .lbl-cam { color: #fde68a; border-color: rgba(249,115,22,.45); }
   .lbl-dist { color: #bae6fd; border-color: rgba(56,189,248,.45); }
   .lbl-height { color: #ffffff; border-color: rgba(255,255,255,.35); }
+  .lbl-ground { color: #d9f99d; border-color: rgba(163,230,53,.4); }
 
   /* ---------- Readouts (M2 placeholders) ---------- */
   .readout-big { font-size: 30px; font-weight: 700; line-height: 1; margin: 2px 0; color: var(--text); }
@@ -275,12 +279,16 @@
         <select id="topology">
           <option value="dome">Dome (upper hemi)</option>
           <option value="ring">Ring</option>
+          <option value="dring">Double ring (2 levels)</option>
           <option value="arc">Arc</option>
           <option value="sphere">Sphere</option>
         </select></div></div>
       <div class="row"><label>Radius (m)</label><div class="ctl"><input type="number" id="radius" step="0.1" min="0.5" /></div></div>
       <div class="row"><label>Min cam height (m)</label><div class="ctl"><input type="number" id="minHeight" step="0.05" min="0" /></div></div>
       <div class="row"><label>Arc span (°)</label><div class="ctl"><input type="number" id="arcSpan" step="5" min="10" max="360" /></div></div>
+      <div class="row"><label>Rotate rig (°)</label><div class="ctl">
+        <input type="range" id="azimuth" min="0" max="360" step="1" style="flex:1;min-width:90px" />
+        <span id="azimuthVal" style="min-width:36px;text-align:right;align-self:center">0°</span></div></div>
       <div class="row"><label>Look-at</label><div class="ctl vec">
         <input type="number" id="lookX" step="0.05" /><input type="number" id="lookY" step="0.05" /><input type="number" id="lookZ" step="0.05" /></div></div>
       <div class="btn-row">
@@ -326,9 +334,11 @@
       <div class="row"><label>Spacing pairs</label><div class="ctl">
         <select id="spacingMode"><option value="nearest">Nearest neighbor</option><option value="all">All pairs</option></select></div></div>
       <div class="row"><label>Tripods + heights</label><div class="ctl"><input type="checkbox" id="showTripods"></div></div>
+      <div class="row"><label>Ground dist to subject</label><div class="ctl"><input type="checkbox" id="showGround"></div></div>
       <div class="stat-line"><span>Dome radius</span><b id="mRadius">—</b></div>
       <div class="stat-line"><span>Spacing min/mean/max</span><b id="mSpacing">—</b></div>
       <div class="stat-line"><span>Cam height min/mean/max</span><b id="mHeight">—</b></div>
+      <div class="stat-line"><span>Ground dist min/mean/max</span><b id="mGround">—</b></div>
       <div class="stat-line"><span>Cams outside room</span><b id="mOutside">—</b></div>
       <div class="hint">Room is a visual fit-check (cameras stay on the dome). Spacing labels show camera-to-camera distances — nearest neighbor, or every pair. Inputs are meters; readouts honor the unit selector.</div>
     </div>
@@ -454,14 +464,14 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 const DEFAULT_CONFIG = {
   subject: { type: 'human_reclining', lengthOrHeight: 1.7, bodyThickness: 0.28, center: [0, 0.72, 0], sampleCount: 2000 },
   bed:     { enabled: true, size: [1.5, 0.6, 2.0], topY: 0.6, center: [0, 0, 0] },
-  rig:     { topology: 'dome', cameraCount: 8, radius: 2.5, minCameraHeight: 0.6, arcSpanDeg: 360, lookAt: [0, 0.72, 0], cameras: [] },
+  rig:     { topology: 'dome', cameraCount: 8, radius: 2.5, minCameraHeight: 0.6, arcSpanDeg: 360, azimuthDeg: 0, lookAt: [0, 0.72, 0], cameras: [] },
   camera:  { fovHDeg: 60, aspect: 16 / 9, near: 0.1, far: 10.0 },
   matcher: { preset: 'colmap', minParallaxDeg: 10, maxParallaxDeg: 28, grazingLimitDeg: 78, minEdgePoints: 40 },
   roi:     { enabled: false, shape: 'box', center: [0, 0.85, 0.4], size: [0.4, 0.4, 0.4] },
   optimizer: { enabled: false, iterations: 1500, minCamSeparationDeg: 12, fixedCameras: [], objective: 'goodCoverage' },
   // Physical-room reference + measurement display. Room is a visual fit-check, NOT a hard wall.
   room:    { enabled: true, size: [5.5, 3.0, 5.5], center: [0, 0, 0] }, // [W(x), H(y), D(z)] m; floor at y=0 (fits the default dome)
-  display: { units: 'ft', camLabels: false, spacing: false, spacingMode: 'all', tripods: true },
+  display: { units: 'ft', camLabels: false, spacing: false, spacingMode: 'all', tripods: true, groundDist: true },
 };
 const MATCHER_PRESETS = {
   roma:   { minParallaxDeg: 8,  maxParallaxDeg: 45 },
@@ -1373,9 +1383,12 @@ function updateMeasurements() {
   }
   buildSpacing(pairs);
   ensureTripods(); syncTripods();
+  ensureGround(); syncGround();
   $('mRadius').textContent = fmtLen(config.rig.radius);
   if (n) { const hs = rigCams.map(rc => rc.body.position.y); $('mHeight').textContent = `${fmtLen(Math.min(...hs))} / ${fmtLen(hs.reduce((a, b) => a + b, 0) / n)} / ${fmtLen(Math.max(...hs))}`; }
   else $('mHeight').textContent = '—';
+  if (n) { const gd = rigCams.map(rc => Math.hypot(rc.body.position.x - config.bed.center[0], rc.body.position.z - config.bed.center[2])); $('mGround').textContent = `${fmtLen(Math.min(...gd))} / ${fmtLen(gd.reduce((a, b) => a + b, 0) / n)} / ${fmtLen(Math.max(...gd))}`; }
+  else $('mGround').textContent = '—';
   if (dists.length) {
     const mn = Math.min(...dists), mx = Math.max(...dists), mean = dists.reduce((a, b) => a + b, 0) / dists.length;
     $('mSpacing').textContent = `${fmtLen(mn)} / ${fmtLen(mean)} / ${fmtLen(mx)}`;
@@ -1437,6 +1450,53 @@ function syncTripods() {
     if (t !== lbl.userData.lastText) { lbl.element.textContent = t; lbl.userData.lastText = t; }
   }
   tripodLines.geometry.attributes.position.needsUpdate = true;
+}
+
+// Ground-distance lines: tripod base (on the floor) -> subject ground center, labelled with the
+// horizontal floor distance (how far out to place each stand from the person). Synced every frame.
+let groundLines = null, groundLabels = [];
+const groundMat = new THREE.LineBasicMaterial({ color: 0xa3e635, transparent: true, opacity: 0.45 });
+
+function clearGround() {
+  if (groundLines) { scene.remove(groundLines); groundLines.geometry.dispose(); groundLines = null; }
+  for (const l of groundLabels) { scene.remove(l); if (l.element && l.element.parentNode) l.element.parentNode.removeChild(l.element); }
+  groundLabels = [];
+}
+
+function ensureGround() {
+  if (!config.display.groundDist) { if (groundLines || groundLabels.length) clearGround(); return; }
+  if (groundLines && groundLabels.length === rigCams.length) return;
+  clearGround();
+  const n = rigCams.length;
+  if (!n) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(n * 6), 3));
+  groundLines = new THREE.LineSegments(geo, groundMat);
+  groundLines.raycast = () => {};
+  groundLines.frustumCulled = false;
+  scene.add(groundLines);
+  for (let i = 0; i < n; i++) {
+    const div = document.createElement('div'); div.className = 'lbl lbl-ground';
+    const lbl = new CSS2DObject(div); lbl.userData.lastText = '';
+    scene.add(lbl); groundLabels.push(lbl);
+  }
+}
+
+function syncGround() {
+  if (!groundLines || !config.display.groundDist) return;
+  const cx = config.bed.center[0], cz = config.bed.center[2];   // subject is centered on the bed
+  const arr = groundLines.geometry.attributes.position.array;
+  for (let i = 0; i < rigCams.length && i < groundLabels.length; i++) {
+    const p = rigCams[i].body.position, o = i * 6;
+    arr[o] = p.x; arr[o + 1] = 0.012; arr[o + 2] = p.z;     // tripod base (just above floor)
+    arr[o + 3] = cx; arr[o + 4] = 0.012; arr[o + 5] = cz;   // subject ground center
+    const dist = Math.hypot(p.x - cx, p.z - cz);             // horizontal floor distance
+    const lbl = groundLabels[i];
+    lbl.position.set((p.x + cx) / 2, 0.07, (p.z + cz) / 2);
+    const t = fmtLen(dist);
+    if (t !== lbl.userData.lastText) { lbl.element.textContent = t; lbl.userData.lastText = t; }
+  }
+  groundLines.geometry.attributes.position.needsUpdate = true;
 }
 
 // ============================================================================
@@ -1537,6 +1597,7 @@ async function exportPDF() {
   row('Dome radius', txt('mRadius'));
   row('Cam spacing min/mean/max', txt('mSpacing'));
   row('Cam height min/mean/max', txt('mHeight'));
+  row('Ground dist to subject min/mean/max', txt('mGround'));
   row('Cameras outside room', config.room.enabled ? `${outside}${outside ? ' (outside!)' : ' (all inside)'}` : 'room off');
 
   h1('Floor plan (top-down)');
@@ -1678,7 +1739,7 @@ function domePoint(i, n) {
   const golden = Math.PI * (3 - Math.sqrt(5));
   const y = yMinUnit + (1 - yMinUnit) * ((i + 0.5) / n);
   const rad = Math.sqrt(Math.max(0, 1 - y * y));
-  const theta = i * golden;
+  const theta = i * golden + d2r(c.azimuthDeg || 0);
   const pos = new THREE.Vector3(
     config.bed.center[0] + c.radius * Math.cos(theta) * rad,
     c.radius * y,
@@ -1692,7 +1753,7 @@ function spherePoint(i, n) {
   const golden = Math.PI * (3 - Math.sqrt(5));
   const y = 1 - (i + 0.5) / n * 2;          // 1..-1
   const rad = Math.sqrt(Math.max(0, 1 - y * y));
-  const theta = i * golden;
+  const theta = i * golden + d2r(c.azimuthDeg || 0);
   const pos = new THREE.Vector3(
     config.bed.center[0] + c.radius * Math.cos(theta) * rad,
     c.radius * y,
@@ -1704,7 +1765,7 @@ function spherePoint(i, n) {
 function ringPoint(i, n, elevDeg) {
   const c = config.rig;
   const span = d2r(c.arcSpanDeg);
-  const a = n > 1 ? -span / 2 + span * (i / (c.arcSpanDeg >= 360 ? n : (n - 1))) : 0;
+  const a = (n > 1 ? -span / 2 + span * (i / (c.arcSpanDeg >= 360 ? n : (n - 1))) : 0) + d2r(c.azimuthDeg || 0);
   const elev = d2r(elevDeg);
   const y = Math.max(c.minCameraHeight, c.radius * Math.sin(elev));
   const dy = y;
@@ -1720,11 +1781,32 @@ function ringPoint(i, n, elevDeg) {
   return pos;
 }
 
+// Double ring: two stacked rings on a cylinder (same horizontal radius). The top ring sits DIRECTLY
+// above the bottom ring (same azimuths), so each stand carries a low + high camera. Honors arcSpan
+// and minCameraHeight; not snapped to the sphere (that would break the vertical alignment).
+function doubleRingPoint(i, n) {
+  const c = config.rig;
+  const perRing = Math.max(1, Math.ceil(n / 2));
+  const ring = i < perRing ? 0 : 1;          // 0 = bottom, 1 = top
+  const k = ring === 0 ? i : i - perRing;     // index within this ring
+  const span = d2r(c.arcSpanDeg);
+  const a = (perRing > 1 ? -span / 2 + span * (k / (c.arcSpanDeg >= 360 ? perRing : (perRing - 1))) : 0) + d2r(c.azimuthDeg || 0);
+  const rh = Math.max(0.1, c.radius);          // horizontal ring radius
+  const gap = Math.max(0.5, 0.55 * c.radius);  // vertical separation between the two rings
+  const y = c.minCameraHeight + (ring === 1 ? gap : 0);
+  return new THREE.Vector3(
+    config.bed.center[0] + rh * Math.cos(a),
+    y,
+    config.bed.center[2] + rh * Math.sin(a),
+  );
+}
+
 function makePoint(i, n) {
   switch (config.rig.topology) {
     case 'sphere': return spherePoint(i, n);
     case 'ring':   return ringPoint(i, n, 22);
     case 'arc':    return ringPoint(i, n, 28);
+    case 'dring':  return doubleRingPoint(i, n);
     case 'dome':
     default:       return domePoint(i, n);
   }
@@ -1874,6 +1956,8 @@ function syncFormFromConfig() {
   $('radius').value = config.rig.radius;
   $('minHeight').value = config.rig.minCameraHeight;
   $('arcSpan').value = config.rig.arcSpanDeg;
+  $('azimuth').value = config.rig.azimuthDeg || 0;
+  $('azimuthVal').textContent = Math.round(config.rig.azimuthDeg || 0) + '°';
   $('lookX').value = config.rig.lookAt[0]; $('lookY').value = config.rig.lookAt[1]; $('lookZ').value = config.rig.lookAt[2];
   $('fovH').value = config.camera.fovHDeg;
   $('aspect').value = +config.camera.aspect.toFixed(4);
@@ -1891,6 +1975,7 @@ function syncFormFromConfig() {
   $('showSpacing').checked = config.display.spacing;
   $('spacingMode').value = config.display.spacingMode;
   $('showTripods').checked = config.display.tripods;
+  $('showGround').checked = config.display.groundDist;
   syncROIFields();
 }
 
@@ -1918,16 +2003,25 @@ function wireUI() {
   $('topology').addEventListener('change', e => { config.rig.topology = e.target.value; distributeCameras(); });
   $('radius').addEventListener('change', () => { config.rig.radius = Math.max(0.5, num('radius', 2.5)); distributeCameras(); scheduleReachability(); });
   $('arcSpan').addEventListener('change', () => { config.rig.arcSpanDeg = Math.min(360, Math.max(10, num('arcSpan', 360))); distributeCameras(); });
+  // Rotate the WHOLE rig around the vertical axis: spin the current cameras (incl. hand-dragged) by the delta.
+  const onAzimuth = () => {
+    const newAz = num('azimuth', 0);
+    const delta = d2r(newAz - (config.rig.azimuthDeg || 0));
+    config.rig.azimuthDeg = newAz;
+    $('azimuthVal').textContent = Math.round(newAz) + '°';
+    const cx = config.bed.center[0], cz = config.bed.center[2], ca = Math.cos(delta), sa = Math.sin(delta);
+    for (const rc of rigCams) {
+      const p = rc.body.position, dx = p.x - cx, dz = p.z - cz;
+      p.x = cx + dx * ca - dz * sa;   // rotate about Y → y (height) unchanged, so min-height stays satisfied
+      p.z = cz + dx * sa + dz * ca;
+      aimGizmo(rc);
+    }
+    updateHUD(); scheduleCoverage(120);   // debounced heatmap; gizmos/tripods rotate live every frame
+  };
+  $('azimuth').addEventListener('input', onAzimuth);
   $('minHeight').addEventListener('change', () => {
     config.rig.minCameraHeight = Math.max(0, num('minHeight', 0.6));
-    // Lift any existing camera that now violates the constraint back onto the dome.
-    for (const rc of rigCams) {
-      if (rc.body.position.y < config.rig.minCameraHeight) {
-        finalizeOnDome(rc.body.position); aimGizmo(rc);
-      }
-    }
-    updateHUD();
-    scheduleCoverage(0);
+    distributeCameras();      // redistribute so cameras follow the min height UP and back DOWN symmetrically
     scheduleReachability();   // candidate dome min-height changed
   });
   const onLook = () => {
@@ -2002,6 +2096,7 @@ function wireUI() {
   $('showSpacing').addEventListener('change', e => { config.display.spacing = e.target.checked; updateMeasurements(); });
   $('spacingMode').addEventListener('change', e => { config.display.spacingMode = e.target.value; updateMeasurements(); });
   $('showTripods').addEventListener('change', e => { config.display.tripods = e.target.checked; updateMeasurements(); });
+  $('showGround').addEventListener('change', e => { config.display.groundDist = e.target.checked; updateMeasurements(); });
 
   // Config import/export
   $('btnExport').addEventListener('click', exportConfig);
@@ -2119,6 +2214,7 @@ function animate() {
   requestAnimationFrame(animate);
   controls.update();
   syncTripods();   // keep tripod lines + height labels glued to the cameras every frame
+  syncGround();     // ...and the ground-distance lines/labels
   renderer.render(scene, viewCam);
   labelRenderer.render(scene, viewCam);
 }
