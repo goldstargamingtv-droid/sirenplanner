@@ -1299,6 +1299,8 @@ let roomLines = null, spacingLines = null, spacingLabels = [];
 const camBodyMatOutside = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0x6a1010, emissiveIntensity: 0.8, roughness: 0.45, metalness: 0.3 });
 const M_PER_FT = 0.3048;
 function fmtLen(m) { return config.display.units === 'ft' ? (m / M_PER_FT).toFixed(2) + ' ft' : m.toFixed(2) + ' m'; }
+// Down-tilt angle (deg) to aim a camera at the look-at point: + = tilt the head DOWN, - = tilt UP.
+function camTiltDeg(camY, groundDist) { return Math.atan2(camY - config.rig.lookAt[1], groundDist) * 180 / Math.PI; }
 
 // Room dimension inputs are shown/edited in the selected unit; config.room.size stays in meters.
 function syncRoomFields() {
@@ -1446,7 +1448,9 @@ function syncTripods() {
     arr[o + 3] = p.x; arr[o + 4] = 0; arr[o + 5] = p.z;        // straight down to the floor
     const lbl = heightLabels[i];
     lbl.position.set(p.x, p.y * 0.5, p.z);
-    const t = fmtLen(p.y);
+    const gd = Math.hypot(p.x - config.bed.center[0], p.z - config.bed.center[2]);
+    const td = Math.round(camTiltDeg(p.y, gd));
+    const t = fmtLen(p.y) + '  ' + (td > 1 ? `↓${td}°` : td < -1 ? `↑${-td}°` : 'level');
     if (t !== lbl.userData.lastText) { lbl.element.textContent = t; lbl.userData.lastText = t; }
   }
   tripodLines.geometry.attributes.position.needsUpdate = true;
@@ -1618,15 +1622,16 @@ async function exportPDF() {
   addImg(imgPlan, 210);
   caption('Floor plan, looking straight down. The dot in the middle is the subject; each line is a camera stand and how far it sits from the subject.');
   para('Setup steps: (1) Mark the subject position on the floor - that is the center. (2) Pick a front direction and call it 12 o\'clock. (3) For each camera in the table, measure the Floor distance straight out in the listed Direction, set up a tripod, raise the camera to the Camera height, and aim it at the subject.');
-  const cwB = [32, 92, 120, 96, 70];
+  const tiltStr = (camY, gd) => { const r = Math.round(camTiltDeg(camY, gd)); return r > 1 ? `down ${r} deg` : (r < -1 ? `up ${-r} deg` : 'level'); };
+  const cwB = [26, 78, 104, 74, 78, 56];
   const buildRows = rigCams.map((rc, i) => {
     const p = rc.body.position;
     const gd = Math.hypot(p.x - config.bed.center[0], p.z - config.bed.center[2]);
-    const note = [rc.locked ? 'locked' : '', cameraOutsideRoom(p) ? 'OUTSIDE ROOM' : ''].filter(Boolean).join(' ');
-    return [`${i + 1}`, `${uNum(gd)} ${uL}`, bearing(p.x, p.z), `${uNum(p.y)} ${uL}`, note];
+    const note = [rc.locked ? 'locked' : '', cameraOutsideRoom(p) ? 'OUT OF ROOM' : ''].filter(Boolean).join(' ');
+    return [`${i + 1}`, `${uNum(gd)} ${uL}`, bearing(p.x, p.z), `${uNum(p.y)} ${uL}`, tiltStr(p.y, gd), note];
   });
-  table(['CAM', 'Floor dist', 'Direction', 'Camera height', 'Notes'], cwB, buildRows);
-  caption('Floor dist = how far out from the subject to place the stand (measured on the ground). Direction = clock position around the subject (12 = your chosen front). Camera height = how high to set the camera off the floor.');
+  table(['CAM', 'Floor dist', 'Direction', 'Height', 'Tilt', 'Notes'], cwB, buildRows);
+  caption('Floor dist = how far out to place the stand. Direction = clock position (12 = your chosen front). Height = camera height off the floor. Tilt = how far to angle the camera DOWN (or up) on the tripod head to aim at the subject. Notes flag locked or out-of-room stands.');
 
   // ===== Reference =====
   h1('Coverage details (reference)');
